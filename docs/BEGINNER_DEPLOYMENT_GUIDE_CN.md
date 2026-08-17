@@ -1,617 +1,634 @@
-# NetTrafficSentinel 小白部署与代码说明
+# NetTrafficSentinel 小白部署与代码说明（历史基线 + Doris 延迟入库版）
 
-> 适用环境：Java 8/11、Apache Flink 1.17.2、Apache Doris 2.1.x、YARN。
->
-> 这份文档按“第一次接触该项目的人也能照着操作”的方式编写。
+本文假设你以前没有维护过 Flink 长任务，也尽量按“照着做即可”的方式解释。
 
 ---
 
-## 1. 这个程序是做什么的？
+# 1. 这个程序做什么
 
-程序会一直运行在 YARN 上，每隔一段时间检查：
-
-> “下一个 5 分钟数据窗口是不是已经完整写入 Doris 了？”
-
-如果已经完整，就查询这个窗口的数据，并执行两条异常规则。
-
-例如业务时区为 `Asia/Shanghai`，配置：
-
-```properties
-window.size.minutes=5
-window.delay.minutes=1
-```
-
-在 20:11 左右，程序认为下面这个窗口已经安全闭合：
+数据来源：
 
 ```text
-[20:05:00, 20:10:00)
+Doris
+anomaly_detection.metric_endpoint
 ```
 
-然后查询：
+数据本身已经按分钟聚合。
+
+程序每次处理一个 5 分钟区间，例如：
 
 ```text
-collectTime >= 20:05:00
-collectTime <  20:10:00
+11:30:00 <= collectTime < 11:35:00
 ```
 
-分析完成后，游标推进到：
+然后检测两类异常：
 
 ```text
-20:10:00
+2 = 异常大流量
+3 = 非工作时段活跃连接 Top100
 ```
 
-等到下一个窗口可以读取时，再处理：
+结果可以：
 
 ```text
-[20:10:00, 20:15:00)
+写 TaskManager/YARN 日志
+写 Kafka anomaly_alert
 ```
 
-因此，只需要提交一次 Flink 任务。
+两个输出开关彼此独立。
 
 ---
 
-## 2. 为什么不用 Doris Flink Connector 一直读？
+# 2. 为什么不能按照系统当前时间直接查询
 
-Doris Flink Connector 的读取 Source 是 bounded source。
+你们 Doris 存在明显延迟。
 
-可以理解为：
-
-```text
-它擅长：给一个查询范围 -> 把这一批数据读完 -> Source 结束
-
-它不等同于：
-Kafka Consumer -> 永远等待未来的新消息
-```
-
-所以要做一个不退出、永远每 5 分钟继续读新数据的任务，本工程采用：
+比如：
 
 ```text
-Flink 自定义 SourceFunction
-        |
-        +-- 每次生成一个 5 分钟 SQL
-        |
-        +-- JDBC 连接 Doris FE 9030
-        |
-        +-- ResultSet 逐行读取
-        |
-        +-- 边读取边更新 Sketch
-        |
-        +-- 整个窗口完成后输出告警
-        |
-        +-- 等下一个 5 分钟窗口
+系统现在 20:00
+但是 Doris 今天 12:00 左右的数据才刚入库
 ```
 
-Doris 使用 MySQL 网络协议，因此可以通过 MySQL JDBC Driver 查询。
+如果程序认为：
+
+```text
+20:00 已经到了
+=> 19:55~20:00 一定有数据
+```
+
+就会不停查到：
+
+```text
+rows=0
+```
+
+旧版还会把 cursor 向前推进，这样晚几个小时补进 Doris 的数据就永远不会再查。
+
+新版不再这样做。
 
 ---
 
-## 3. 为什么 JDBC 不会把几千万行全部放进内存？
+# 3. 新版 Doris 数据 Watermark
 
-普通 JDBC 驱动有可能先把整个 ResultSet 缓存到客户端内存。
-
-本工程创建 Statement 时使用：
-
-```java
-connection.createStatement(
-    ResultSet.TYPE_FORWARD_ONLY,
-    ResultSet.CONCUR_READ_ONLY
-);
-
-statement.setFetchSize(Integer.MIN_VALUE);
-```
-
-这是 MySQL Connector/J 的 streaming ResultSet 模式。
-
-程序读取一行、处理一行，不需要把整个 5 分钟窗口先变成一个 Java List。
-
-逻辑是：
-
-```text
-Doris row 1  -> Sketch
-Doris row 2  -> Sketch
-Doris row 3  -> Sketch
-...
-Doris row N  -> Sketch
-```
-
-而不是：
-
-```text
-Doris -> List<几千万行> -> 再分析
-```
-
----
-
-## 4. 项目目录怎么看？
-
-核心目录：
-
-```text
-NetTrafficSentinel/
-├── pom.xml
-├── application.properties
-├── run-yarn.sh
-├── build.sh
-├── README.md
-├── docs/
-│   └── BEGINNER_DEPLOYMENT_GUIDE_CN.md
-└── src/
-    ├── main/
-    │   ├── java/
-    │   │   └── cn/ac/iie/
-    │   │       ├── topology/
-    │   │       │   └── NetTrafficSentinel.java
-    │   │       └── anomaly/
-    │   │           ├── config/
-    │   │           ├── model/
-    │   │           ├── rule/
-    │   │           ├── sink/
-    │   │           ├── sketch/
-    │   │           ├── source/
-    │   │           └── util/
-    │   └── resources/
-    │       └── application.properties
-    └── test/
-```
-
-下面逐个解释。
-
----
-
-# 5. 主类：NetTrafficSentinel.java
-
-路径：
-
-```text
-src/main/java/cn/ac/iie/topology/NetTrafficSentinel.java
-```
-
-它是整个程序的入口，相当于普通 Java 程序的：
-
-```java
-public static void main(String[] args)
-```
-
-主要做 5 件事。
-
-### 第 1 件：读取 application.properties
-
-```java
-AppConfig config = AppConfig.load(args);
-```
-
-提交命令中：
-
-```bash
---config application.properties
-```
-
-就是告诉它读取这个文件。
-
-### 第 2 件：创建 Flink 环境
-
-```java
-StreamExecutionEnvironment env =
-    StreamExecutionEnvironment.getExecutionEnvironment();
-```
-
-并设置 streaming mode。
-
-### 第 3 件：开启 checkpoint
-
-checkpoint 主要用于保存：
-
-```text
-当前已经处理到哪个 5 分钟窗口
-```
-
-例如保存：
-
-```text
-nextWindowStart = 2026-08-17 20:15:00
-```
-
-任务内部发生失败并恢复时，可以继续从该游标处理。
-
-### 第 4 件：创建 DorisPollingAlertSource
-
-```java
-.addSource(new DorisPollingAlertSource(config))
-```
-
-这个 Source 是持续运行的核心。
-
-### 第 5 件：告警输出
-
-告警先转 JSON：
-
-```text
-AlertRecord -> JSON String
-```
-
-再根据开关决定：
-
-```text
-日志
-Kafka
-日志 + Kafka
-都不输出
-```
-
----
-
-# 6. 最重要的类：DorisPollingAlertSource.java
-
-路径：
-
-```text
-src/main/java/cn/ac/iie/anomaly/source/DorisPollingAlertSource.java
-```
-
-它可以理解成一个无限循环：
-
-```text
-while (程序没有被停止) {
-    判断下一个 5 分钟窗口是否已经闭合;
-
-    if (还没闭合) {
-        sleep;
-        continue;
-    }
-
-    查询这个 5 分钟窗口;
-    计算异常;
-    输出告警;
-    游标 += 5 分钟;
-}
-```
-
-真实代码还加入了：
-
-- Doris 查询失败重试
-- checkpoint 游标恢复
-- Flink metrics
-- 取消任务时主动关闭 JDBC Statement/Connection
-- 坏数据跳过
-- SQL 查询进度日志
-
----
-
-## 6.1 什么叫“游标”？
-
-假设：
-
-```text
-nextWindowStart = 20:10
-```
-
-窗口大小是 5 分钟，那么它下一次查询：
-
-```text
-[20:10,20:15)
-```
-
-成功后：
-
-```text
-nextWindowStart = 20:15
-```
-
-下一次就是：
-
-```text
-[20:15,20:20)
-```
-
-所以这个时间就是持续处理的核心进度。
-
----
-
-## 6.2 如果 Doris 查询失败怎么办？
-
-例如正在处理：
-
-```text
-[20:10,20:15)
-```
-
-查询到一半 Doris 连接断了。
-
-程序**不会**把游标改成 20:15。
-
-仍然保持：
-
-```text
-nextWindowStart = 20:10
-```
-
-等待：
-
-```properties
-source.retry.interval.seconds=30
-```
-
-然后重新查询：
-
-```text
-[20:10,20:15)
-```
-
-默认连续失败：
-
-```properties
-source.retry.max.failures=10
-```
-
-次以后抛异常，让 Flink restart strategy 接管。
-
----
-
-## 6.3 为什么不是每读一条 Doris 数据就发给下游？
-
-这是故障恢复设计。
-
-假设一个窗口 1000 万行。
-
-如果已经把前 500 万行发给 Flink window operator，然后发生故障：
-
-```text
-checkpoint 中可能已经保存了前 500 万行的聚合状态
-```
-
-Source 恢复以后又从 Doris 把完整 1000 万行重读一次，就可能让前半部分重复统计。
-
-所以当前实现采用：
-
-```text
-Doris 原始数据
-    |
-    v
-Source 内部 Sketch
-    |
-    | 整个 ResultSet 完成
-    v
-最终 AlertRecord
-    |
-    v
-Flink 下游 Sink
-```
-
-整个 5 分钟 SQL 没完成之前，不向下游发送半成品。
-
-这样中途失败最多重新计算这一个窗口。
-
----
-
-# 7. WindowRange.java
-
-路径：
-
-```text
-src/main/java/cn/ac/iie/anomaly/config/WindowRange.java
-```
-
-负责计算时间窗口。
-
-例如现在业务时间：
-
-```text
-20:11:30
-```
-
-配置：
-
-```properties
-window.size.minutes=5
-window.delay.minutes=1
-```
-
-先减 landing delay：
-
-```text
-20:10:30
-```
-
-然后向下对齐到 5 分钟：
-
-```text
-20:10:00
-```
-
-因此最新闭合窗口的 end 是：
-
-```text
-20:10:00
-```
-
-最新完整窗口就是：
-
-```text
-[20:05,20:10)
-```
-
----
-
-# 8. Doris SQL 是什么样？
-
-实际只读取业务需要的字段：
+程序定期执行类似：
 
 ```sql
-SELECT
-    collectTime,
-    srcIp,
-    dstIp,
-    protocol,
-    connCount,
-    c2sPkts,
-    s2cPkts,
-    c2sBytes,
-    s2cBytes
+SELECT MAX(collectTime)
 FROM anomaly_detection.metric_endpoint
-WHERE ...
+WHERE dayTime >= '最近几天'
+  AND dayTime <= '今天';
 ```
 
-没有读取：
+假设结果：
 
 ```text
-connTimeSeries
-connBytesSeries
+MAX(collectTime)=12:37
 ```
 
-因为这两个 TEXT 字段对当前规则没有用，读取它们只会增加网络、反序列化和内存压力。
-
-时间条件同时使用：
+这个结果只能说明：
 
 ```text
-dayTime
-dayHourTime
-collectTime
+Doris 至少已经出现了 12:37 的记录
 ```
 
-例如：
-
-```sql
-WHERE dayTime >= '2026-08-17'
-  AND dayTime <= '2026-08-17'
-  AND dayHourTime >= '2026-08-17 20:00:00'
-  AND dayHourTime <  '2026-08-17 21:00:00'
-  AND collectTime >= '2026-08-17 20:05:00'
-  AND collectTime <  '2026-08-17 20:10:00'
-```
-
-`collectTime` 保证精确 5 分钟；前两个时间字段帮助 Doris 做分区/范围裁剪。
-
----
-
-# 9. FiveMinuteWindowAnalyzer.java
-
-路径：
+不能保证：
 
 ```text
-src/main/java/cn/ac/iie/anomaly/rule/FiveMinuteWindowAnalyzer.java
+12:36 以前所有迟到数据 100% 已经到齐
 ```
 
-这个类拿到每一行 `MetricRecord` 后，同时给两条规则喂数据。
+所以还要减一个稳定等待时间。
 
-伪代码：
-
-```java
-for each Doris row {
-    largeTrafficAccumulator.add(row);
-
-    if (当前时间属于非工作时段) {
-        offHoursAccumulator.add(row);
-    }
-}
-```
-
-窗口结束后：
-
-```text
-LargeTrafficDetector.detect(...)
-OffHoursDetector.detect(...)
-```
-
-产生告警。
-
----
-
-# 10. 规则一：异常大流量
-
-## 10.1 输入指标
-
-```text
-currentBytes = c2sBytes + s2cBytes
-currentPkts  = c2sPkts  + s2cPkts
-```
-
-连接 Key：
-
-```text
-srcIp | dstIp | protocol
-```
-
-例如：
-
-```text
-10.1.1.10|10.2.2.20|TCP
-```
-
----
-
-## 10.2 T-Digest 是干什么的？
-
-它近似回答：
-
-```text
-这个 5 分钟窗口中，P99.9 流量大概是多少？
-```
-
-如果窗口有 100 万条：
-
-```text
-P99.9
-```
-
-可以简单理解为“最靠近顶部 0.1% 的流量分界线”。
-
-它不需要把 100 万个数字全部排序保存在内存。
-
----
-
-## 10.3 Count-Min Sketch 是干什么的？
-
-正常办法可能写：
-
-```java
-Map<String, Long> pairByteSum
-Map<String, Long> pairPktSum
-Map<String, Long> pairCount
-```
-
-如果 IP Pair 数量特别大，这些 Map 会非常大。
-
-CMS 改成固定二维数组：
+默认：
 
 ```properties
-rule.large.cms.depth=5
-rule.large.cms.width=262144
+source.doris.stable.delay.minutes=60
 ```
 
-三张 long CMS 估算内存：
+于是：
 
 ```text
-5 * 262144 * 8 * 3
-≈ 30 MiB
+12:37 - 60分钟 = 11:37
 ```
 
-无论 pair 数量继续增长，CMS 数组大小不增长。
+再向下取 5 分钟边界：
 
-代价是结果是近似值，并且有 hash collision 带来的高估误差。
+```text
+11:35
+```
+
+所以程序只允许处理：
+
+```text
+windowEnd <= 11:35
+```
 
 ---
 
-## 10.4 candidate heap 为什么存在？
+# 4. 如果 Doris 延迟变化很大怎么办
 
-虽然 T-Digest 能告诉我们 P99.9 是多少，但 T-Digest 本身不能告诉你：
+这个参数越大：
 
-```text
-到底是哪些 srcIp/dstIp 位于 P99.9？
+```properties
+source.doris.stable.delay.minutes
 ```
 
-所以同时保留一个固定大小的“大流量候选池”：
+数据越有机会完整，但告警越晚。
+
+可以从 60 分钟开始。
+
+如果日志仍经常看到：
+
+```text
+Empty Doris window ... Cursor is NOT advanced
+```
+
+说明：
+
+```text
+MAX collectTime 已经很靠后
+但前面的窗口还没有真正到齐/甚至完全没到
+```
+
+可以改为：
+
+```properties
+source.doris.stable.delay.minutes=90
+```
+
+或者：
+
+```properties
+source.doris.stable.delay.minutes=120
+```
+
+由于你们本身就可能延迟数小时，多等 30~60 分钟通常比永久漏数据更重要。
+
+---
+
+# 5. 为什么 MAX(collectTime) 仍然不是绝对完整标记
+
+举例：
+
+```text
+12:30 的数据已经到
+12:10 还有部分批次没到
+```
+
+这时：
+
+```text
+MAX=12:30
+```
+
+但是 12:10 并不完整。
+
+由于上游无法提供：
+
+```text
+12:10 COMPLETE
+```
+
+这种元数据，所以 Flink 端不可能百分之百知道窗口已经完整。
+
+新版采用两道保险：
+
+```text
+MAX collectTime - stableDelay
+              +
+rows=0 时不推进 cursor
+```
+
+这是没有 COMPLETE 标记时的工程折中。
+
+---
+
+# 6. 空窗口处理
+
+默认：
+
+```properties
+source.empty.window.advance=false
+source.empty.window.retry.seconds=300
+```
+
+当一个窗口返回：
+
+```text
+rows=0
+```
+
+程序不会：
+
+```text
+cursor += 5min
+```
+
+而是：
+
+```text
+保留原 cursor
+等待 300 秒
+再次查 Doris Watermark
+再次查询原窗口
+```
+
+对于每天 20~30 亿条的表，一个真正完整的 5 分钟窗口完全没有任何数据的概率通常很低，所以这个策略适合当前场景。
+
+如果未来业务确实允许某些 5 分钟窗口完全没数据，可以改：
+
+```properties
+source.empty.window.advance=true
+```
+
+但这会重新引入“迟到空窗口被跳过”的风险。
+
+---
+
+# 7. type=2 为什么换了算法
+
+旧版 `baseline_bytes` 可能出现：
+
+```text
+current_bytes=19404636
+baseline_bytes=109
+```
+
+原因是旧 baseline 主要来自同一个 5 分钟窗口中的 CMS/中位数 fallback。
+
+它不是：
+
+```text
+这个 IP Pair 过去正常是多少
+```
+
+新版把长期历史拆成两层：
+
+```text
+Context History
++
+Pair History
+```
+
+---
+
+# 8. Context History 是什么
+
+Context 不是 IP。
+
+ContextKey：
+
+```text
+protocol + WORKDAY/WEEKEND + 5分钟时间槽
+```
+
+例如：
+
+```text
+TLS + WORKDAY + 20:20~20:25
+TLS + WEEKEND + 20:20~20:25
+UNKNOWN + WORKDAY + 09:00~09:05
+```
+
+Context 中只记录：
+
+```text
+这一类连接的 bytes 分布
+这一类连接的 pkts 分布
+```
+
+它不知道：
+
+```text
+61.1.1.1 -> 10.1.1.1
+```
+
+因此“Context Sketch 会不会永久保存所有 IP Pair”的答案是：
+
+```text
+不会，它根本不保存 IP Pair。
+```
+
+---
+
+# 9. Context 为什么按日期分桶
+
+t-digest 很适合：
+
+```text
+add
+merge
+quantile
+```
+
+但是已经合并好的 Sketch 不适合精确删除：
+
+```text
+7 天前的某一批原始行
+```
+
+所以不能做：
+
+```text
+一个永远增长的 t-digest
+然后删除 7 天前数据
+```
+
+新版是：
+
+```text
+TLS|WORKDAY|20:20
+    ├── 2026-08-11 digest
+    ├── 2026-08-12 digest
+    ├── 2026-08-13 digest
+    ├── 2026-08-14 digest
+    ├── 2026-08-15 digest
+    ├── 2026-08-16 digest
+    └── 2026-08-17 digest
+```
+
+过期直接扔掉整个日期桶。
+
+默认：
+
+```properties
+history.context.retention.days=7
+```
+
+检测当前日期时，当前日期桶不会参与当前阈值计算，而是使用前面的历史日期。
+
+---
+
+# 10. Context 什么时候开始真正生效
+
+默认：
+
+```properties
+history.context.min.days=2
+```
+
+意思是至少已经有两个历史日期，才把跨日 Context 当作成熟基线。
+
+如果只有 0 或 1 个历史日期：
+
+```text
+Context cold start
+```
+
+暂时使用当前 5 分钟窗口自己的分布作为阈值。
+
+这样第一次启动不会因为没有历史直接把大量连接报成异常。
+
+---
+
+# 11. Context 如何更新
+
+一个窗口完整读取以后：
+
+```text
+先使用旧历史检测当前窗口
+```
+
+检测完成后才生成：
+
+```text
+Context History Update
+```
+
+最终在 checkpoint 临界区提交。
+
+不能：
+
+```text
+先把当前窗口加到历史
+再判断当前窗口
+```
+
+否则异常会抬高自己的阈值。
+
+---
+
+# 12. Context 如何减少异常污染
+
+如果历史 Context 已经成熟，例如历史：
+
+```text
+P99.9 bytes = 3MB
+```
+
+当前来了：
+
+```text
+500MB
+```
+
+历史更新不会直接把 500MB 原值加入正常 Sketch，而是限制在历史高分位附近。
+
+代码概念：
+
+```text
+historyBytes = min(currentBytes, oldHistoricalP99.9)
+```
+
+这样异常值仍然不会无限抬高之后的 Context 基线。
+
+---
+
+# 13. Pair History 是什么
+
+Pair：
+
+```text
+srcIp + dstIp + protocol
+```
+
+例如：
+
+```text
+61.213.176.11|172.217.221.188|TLS
+```
+
+Pair History 保存：
+
+```text
+emaBytes
+emaPkts
+sampleCount
+lastSeenEventTime
+```
+
+为了降低内存，不保存完整 Pair 字符串作为长期 HashMap key，而保存稳定 64 位 hash。
+
+算法允许极低概率 hash collision，这是为了换取固定状态和更低内存。
+
+---
+
+# 14. Pair 会不会一直保存
+
+不会。
+
+有两种淘汰机制。
+
+第一种：TTL。
+
+```properties
+history.pair.ttl.days=7
+```
+
+如果这个 Pair 连续 7 个“数据事件日”没有再次被学习：
+
+```text
+Pair baseline 视为过期
+```
+
+第二种：硬容量。
+
+```properties
+history.pair.max.entries=200000
+```
+
+无论业务产生多少 Pair，长期 PairHistory 最多保留约 20 万条。
+
+超过后淘汰最久没有被更新的 Pair。
+
+---
+
+# 15. 为什么 TTL 用数据时间，而不是机器时间
+
+你们数据会晚几个小时入库。
+
+假如事件发生：
+
+```text
+12:00
+```
+
+但是机器到：
+
+```text
+20:00
+```
+
+才处理。
+
+如果用 processing time 计算 7 天 TTL，会把“入库延迟”混进业务生命周期。
+
+新版 Pair TTL 使用：
+
+```text
+collectTime / window event time
+```
+
+更符合历史流量语义。
+
+---
+
+# 16. Pair EMA 怎么更新
+
+默认：
+
+```properties
+history.pair.ema.alpha=0.10
+```
+
+公式：
+
+```text
+new = old * 0.90 + current * 0.10
+```
+
+例如：
+
+```text
+old baseline = 200000
+current      = 220000
+```
+
+新 baseline：
+
+```text
+202000
+```
+
+EMA 比全历史普通平均值更容易适应业务正常增长。
+
+---
+
+# 17. 为什么不是所有 Pair 都学习 EMA
+
+每天几十亿条数据，不可能维护：
+
+```text
+Map<所有srcIp-dstIp-protocol, PairHistory>
+```
+
+每个 5 分钟窗口只保留固定数量的大流量 Candidate：
 
 ```properties
 rule.large.candidate.capacity=20000
 ```
 
-始终保留窗口内 bytes 最大的一部分记录。
+Pair EMA 只从这些 heavy candidate 中学习。
 
-不是保留全部记录。
+长期状态再由：
+
+```properties
+history.pair.max.entries=200000
+```
+
+做硬限制。
 
 ---
 
-## 10.5 当前异常判断
+# 18. 异常 Pair 是否更新 EMA
+
+不更新。
+
+如果某 Pair 在当前 5 分钟窗口内任何 Candidate 被判断为 type=2：
+
+```text
+该 Pair 当前整个窗口都不回灌 EMA
+```
+
+这样攻击持续 5 次也不会因为连续把异常值加入 EMA 而迅速提高 baseline。
+
+---
+
+# 19. baseline_bytes 最终是什么
+
+优先级：
+
+```text
+1. Pair samples >= history.pair.min.samples
+   -> Pair EMA
+
+2. Pair 没足够样本，但 Context History 成熟
+   -> Context historical P50
+
+3. Context 也冷启动
+   -> 当前 5 分钟 Context P50
+```
+
+默认：
+
+```properties
+history.pair.min.samples=3
+```
+
+因此第一次看见一个新 Pair 时，baseline 很小仍然可能是正常现象。
+
+它表达的是：
+
+```text
+这个 Pair 自身没有历史，只能用同类连接中位数作为 fallback
+```
+
+真正决定报警还要看历史高分位。
+
+---
+
+# 20. type=2 最终阈值
 
 默认：
 
@@ -623,21 +640,14 @@ rule.large.pkts.baseline.multiplier=4.0
 rule.large.extreme.multiplier=2.0
 ```
 
-算法近似为：
+大致逻辑：
 
 ```text
-bytesThreshold = max(
-    全窗口 bytes P99.9,
-    当前 pair 基线 * 4
-)
-
-pktsThreshold = max(
-    全窗口 pkts P99.9,
-    当前 pair 基线 * 4
-)
+bytesThreshold = max(contextP99.9Bytes, baselineBytes * 4)
+pktsThreshold  = max(contextP99.9Pkts, baselinePkts * 4)
 ```
 
-最终：
+告警：
 
 ```text
 currentBytes > bytesThreshold
@@ -645,425 +655,267 @@ AND
 (
     currentPkts > pktsThreshold
     OR
-    currentBytes > P99.9(bytes) * 2
+    currentBytes > contextP99.9Bytes * 2
 )
 ```
 
 ---
 
-## 10.6 baseline 到底是什么？
+# 21. type=3 算法没有变
 
-必须特别注意：
-
-当前版本的：
+非工作时段：
 
 ```text
-baseline_bytes
-baseline_pkts
+工作日：20:00~08:00
+周末：全天
 ```
 
-是**当前 5 分钟窗口内的近似 pair 基线**。
-
-不是：
+每个 5 分钟窗口：
 
 ```text
-过去 7 天平均
-过去 7 天相同时间段
+item=srcIp|dstIp|protocol
+weight=connCount
 ```
 
-原因是当前持续任务只扫描新增的 5 分钟窗口，不重复读取 7 天原始数据。
+使用 Weighted Space-Saving 保存固定数量 Heavy Hitters。
 
-如果业务以后明确要求“7 天历史基线”，建议下一版增加：
-
-```text
-跨窗口持久化 CMS / EWMA / Quantile Sketch
-```
-
-或者 Doris 单独维护 baseline 表。
-
----
-
-# 11. 规则二：非工作时段活跃连接
-
-配置：
-
-```properties
-rule.offhours.weekday.start.hour=20
-rule.offhours.weekday.end.hour=8
-```
-
-定义：
-
-```text
-周一~周五：
-20:00 <= time < 24:00
-或者
-00:00 <= time < 08:00
-
-周六、周日：
-全天
-```
-
-业务时区：
-
-```properties
-business.timezone=Asia/Shanghai
-```
-
----
-
-## 11.1 为什么不用 HashMap 排 Top100？
-
-如果这样写：
-
-```java
-Map<Pair, Long> connectionCount
-```
-
-IP Pair 很多时 Map 可能非常大。
-
-当前使用：
-
-```text
-Weighted Space-Saving Sketch
-```
-
-每条 Doris 聚合记录：
-
-```text
-item   = srcIp|dstIp|protocol
-weight = connCount
-```
-
-例如：
-
-```text
-10.1.1.1 -> 10.2.2.2
-connCount = 156856
-```
-
-一次 update 就把权重 156856 加进去，不需要循环 156856 次。
-
----
-
-## 11.2 TopN 配置
+默认：
 
 ```properties
 rule.offhours.topn=100
 rule.offhours.sketch.capacity=2048
 ```
 
-为什么 capacity 不是 100？
-
-因为近似算法需要更大的候选空间，才能降低第 90~110 名附近的排名抖动。
-
 ---
 
-# 12. 告警 JSON
+# 22. 一个完整窗口的执行顺序
 
-## Type 2
-
-```json
-{
-  "logId": "STATIC_NET_TRAFFIC_ALERT",
-  "collectTime": "2026-08-17 20:01:00",
-  "srcIp": "10.1.1.1",
-  "dstIp": "10.2.2.2",
-  "protocol": "TCP",
-  "anomalyType": 2,
-  "anomalyDetail": {
-    "current_bytes": 5211,
-    "current_pkts": 211,
-    "baseline_bytes": 2500,
-    "baseline_pkts": 56
-  },
-  "remark1": "",
-  "remark2": "",
-  "vendorCode": "V001"
-}
-```
-
-## Type 3
-
-```json
-{
-  "logId": "STATIC_NET_TRAFFIC_ALERT",
-  "collectTime": "2026-08-17 20:04:00",
-  "srcIp": "10.1.1.1",
-  "dstIp": "10.2.2.2",
-  "protocol": "TCP",
-  "anomalyType": 3,
-  "anomalyDetail": {
-    "topRank": 2,
-    "TopN": 100,
-    "conns": 156856
-  },
-  "remark1": "",
-  "remark2": "",
-  "vendorCode": "V001"
-}
-```
-
----
-
-# 13. application.properties 逐项说明
-
-## 13.1 Job
-
-```properties
-job.name=NET-TRAFFIC-ANOMALY
-business.timezone=Asia/Shanghai
-```
-
-`job.name` 是 Flink Web UI 中看到的 Job 名。
-
----
-
-## 13.2 5 分钟窗口
-
-```properties
-window.size.minutes=5
-window.delay.minutes=1
-```
-
-一般不用修改 5。
-
-`delay=1` 是给上游聚合数据一点落库时间。
-
-如果你发现 Doris 在窗口结束后 1 分钟还没有完全写完，可以改为：
-
-```properties
-window.delay.minutes=2
-```
-
-甚至 3。
-
-代价是告警变慢。
-
----
-
-## 13.3 首次启动模式
-
-默认：
-
-```properties
-source.start.mode=latest_closed
-```
-
-表示不补历史，直接从最新完整窗口开始。
-
-如果需要补数：
-
-```properties
-source.start.mode=fixed
-source.start.time=2026-08-17 20:00:00
-```
-
-注意时间必须对齐到 5 分钟，例如：
+非常重要，顺序如下：
 
 ```text
-20:00 OK
-20:05 OK
-20:10 OK
-20:03 不允许
+1. 读取现有 Context / Pair 历史
+2. JDBC streaming 查询 Doris 5 分钟
+3. 当前窗口只更新临时 Sketch / Candidate Heap
+4. 计算 type=2 / type=3
+5. 生成 WindowHistoryUpdate
+6. 查询完整成功后进入 checkpoint lock
+7. 输出告警
+8. 更新 Context 历史
+9. 更新 Pair EMA
+10. cursor += 5 分钟
 ```
 
----
-
-## 13.4 Source 等待和重试
-
-```properties
-source.poll.interval.seconds=15
-source.retry.interval.seconds=30
-source.retry.max.failures=10
-```
-
-`poll` 只是“没到下一个窗口时多久看一次时钟”，不是每 15 秒查询 Doris。
-
-Doris 查询只会针对闭合的新窗口执行。
-
----
-
-## 13.5 Doris
-
-```properties
-doris.jdbc.url=jdbc:mysql://10.166.10.37:9030/...
-doris.table=anomaly_detection.metric_endpoint
-doris.username=root
-doris.password=...
-```
-
-FE HTTP 8031 在这个持续版本中不用于读取。
-
-查询使用的是 FE MySQL query port：
+如果第 2~5 步中途失败：
 
 ```text
-9030
+长期历史没有变化
+cursor 没有变化
 ```
+
+任务重启后重新读同一个窗口即可。
 
 ---
 
-## 13.6 本地日志开关
+# 23. Checkpoint 保存哪些状态
 
-```properties
-alert.output.log.enabled=true
-```
-
-YARN 模式中的“本地日志”实际上是 TaskManager/container 的日志。
-
----
-
-## 13.7 Kafka 开关
-
-```properties
-alert.output.kafka.enabled=false
-```
-
-开启：
-
-```properties
-alert.output.kafka.enabled=true
-kafka.bootstrap.servers=你的broker1:9092,你的broker2:9092
-kafka.topic=anomaly_alert
-```
-
----
-
-## 13.8 Kafka delivery guarantee
-
-默认：
-
-```properties
-kafka.delivery.guarantee=at_least_once
-```
-
-如果使用：
-
-```properties
-kafka.delivery.guarantee=exactly_once
-```
-
-必须保证：
-
-```properties
-checkpoint.enabled=true
-```
-
-并且 Kafka 事务相关配置/权限正确。
-
----
-
-# 14. checkpoint 为什么很重要？
-
-当前 Source checkpoint 的核心值是：
+新版 Source Operator State：
 
 ```text
-nextWindowStart
+next-doris-five-minute-window-v2
+large-traffic-pair-history-v2
+large-traffic-context-history-v2
 ```
 
-如果没有可靠 checkpoint，整个 YARN Application 完全消失以后再手工重新提交，程序不知道上次处理到哪里。
+分别对应：
 
-默认 `latest_closed` 会从最新窗口开始，有可能跳过停机期间的窗口。
+```text
+下一个 5 分钟窗口游标
+Pair EMA 状态
+Context 日期桶 t-digest 状态
+```
 
-所以生产环境建议：
+Context t-digest 在 checkpoint 中使用紧凑二进制序列化，不保存原始行。
+
+---
+
+# 24. 为什么 checkpoint 改为 5 分钟
+
+旧版主要保存一个 cursor，所以 1 分钟 checkpoint 很轻。
+
+新版最多可能有：
+
+```text
+20万 Pair History
++
+多天 Context Bucket
+```
+
+因此默认改为：
+
+```properties
+checkpoint.interval.ms=300000
+checkpoint.timeout.ms=600000
+checkpoint.min.pause.ms=30000
+```
+
+如果实测 checkpoint 很快，可以再缩短。
+
+---
+
+# 25. 生产一定要配置 HDFS checkpoint
+
+如果日志看到：
+
+```text
+Checkpoint storage is set to 'jobmanager'
+```
+
+说明没有配置外部持久化。
+
+修改：
 
 ```properties
 checkpoint.storage.path=hdfs:///flink-checkpoints/net-traffic-sentinel
 ```
 
-这里不能随便照抄，必须确保你的 Hadoop 集群确实能访问这个 HDFS 路径。
+目录必须：
+
+```text
+YARN JobManager 能访问
+TaskManager 能访问
+Flink/Hadoop 配置能解析 HDFS
+```
+
+否则整个 Application 丢失时历史基线也丢失。
 
 ---
 
-# 15. 内部 restart 和“重新提交一个新任务”有什么区别？
+# 26. 配置文件最重要的一组参数
 
-这是新手非常容易混淆的一点。
+```properties
+window.size.minutes=5
 
-## 情况 A：TaskManager 临时挂了
+source.start.mode=latest_data
+source.watermark.poll.interval.seconds=60
+source.watermark.lookback.days=3
+source.doris.stable.delay.minutes=60
+source.empty.window.advance=false
+source.empty.window.retry.seconds=300
 
-Flink JobManager 还活着，Flink 自动 restart。
+rule.large.candidate.capacity=20000
 
-通常会从最近 checkpoint 恢复。
+history.context.retention.days=7
+history.context.slot.minutes=5
+history.context.min.days=2
+history.context.tdigest.compression=100
 
-## 情况 B：整个 YARN Application 被 kill
-
-例如：
-
-```bash
-yarn application -kill application_xxx
+history.pair.ttl.days=7
+history.pair.max.entries=200000
+history.pair.ema.alpha=0.10
+history.pair.min.samples=3
 ```
-
-然后你重新运行：
-
-```bash
-./run-yarn.sh
-```
-
-这相当于一个“新 Job”。
-
-如果没有显式从 savepoint/checkpoint metadata 恢复，它不会自动知道旧 Job 的 cursor。
-
-最简单的运维策略有两个：
-
-1. 正常升级前做 savepoint，然后从 savepoint 启动。
-2. 如果没有 savepoint，重新启动前把 `source.start.mode=fixed` 和 `source.start.time` 设置成你确认的最后窗口。
 
 ---
 
-# 16. 环境检查
+# 27. source.start.mode 怎么选择
 
-在服务器上执行：
+## latest_data
+
+```properties
+source.start.mode=latest_data
+```
+
+第一次启动时：
+
+```text
+先得到 Doris safeWindowEnd
+然后从最新安全窗口开始
+```
+
+适合：
+
+```text
+只关心从现在开始持续检测
+```
+
+缺点：Context 历史需要冷启动积累。
+
+## fixed
+
+```properties
+source.start.mode=fixed
+source.start.time=2026-08-15 00:00:00
+```
+
+适合：
+
+```text
+从一个历史时间补算
+同时预热 Context/Pair history
+```
+
+注意：会产生历史告警。
+
+---
+
+# 28. 第一次从旧版本升级建议
+
+旧版本可能已经出现：
+
+```text
+12:00 数据还没到
+但 cursor 已经跑到 20:00
+```
+
+这意味着中间窗口被跳过。
+
+因此建议不要把旧 cursor 直接当成新版本的真实进度。
+
+推荐：
+
+```text
+停止旧任务
+    ↓
+选择一个确定安全的历史时间
+    ↓
+source.start.mode=fixed
+    ↓
+先只开日志 Sink
+    ↓
+提交新 Application
+    ↓
+观察追数
+    ↓
+追上 Doris safe watermark 后再开 Kafka
+```
+
+---
+
+# 29. 编译前检查
 
 ```bash
 java -version
-```
-
-期望 Java 8 或 Java 11。
-
-检查 Maven：
-
-```bash
 mvn -version
 ```
 
-检查 Flink：
+建议：
 
-```bash
-/home/xgs/flink-1.17.2/bin/flink --version
+```text
+JDK 8 或 JDK 11
+Maven 3.x
 ```
 
-检查 Hadoop/YARN：
+Flink 安装：
 
-```bash
-yarn application -list
+```text
+/home/xgs/flink-1.17.2
 ```
 
 ---
 
-# 17. 先测试 Doris 是否能连接
+# 30. 编译
 
-如果机器上有 mysql client：
-
-```bash
-mysql -h 10.166.10.37 -P 9030 -u root -p
-```
-
-输入密码以后测试：
-
-```sql
-SELECT COUNT(*)
-FROM anomaly_detection.metric_endpoint
-WHERE collectTime >= '2026-08-17 20:00:00'
-  AND collectTime <  '2026-08-17 20:05:00';
-```
-
-如果这里都连不上，先不要启动 Flink。
-
----
-
-# 18. 编译步骤
-
-进入项目目录：
+进入目录：
 
 ```bash
 cd NetTrafficSentinel
@@ -1081,46 +933,41 @@ mvn clean package
 ls -lh target/NetTrafficSentinel-1.0-SNAPSHOT.jar
 ```
 
-如果存在，就说明业务 JAR 已生成。
-
 ---
 
-# 19. 为什么 Flink 依赖是 provided？
+# 31. 为什么 Flink 依赖是 provided
 
-服务器已经有：
+`pom.xml` 中 Flink runtime 依赖由集群自己的：
 
 ```text
 /home/xgs/flink-1.17.2
 ```
 
-因此 Flink 核心类不需要重复全部塞进业务 JAR。
+提供。
 
-但是这些依赖会 shade 进业务 JAR：
+业务 JAR 会打入：
 
 ```text
 MySQL Connector/J
-Flink Kafka Connector
-T-Digest
+Kafka Connector
+t-digest
 Jackson
 ```
 
+避免把整套 Flink runtime 重复塞进业务 JAR。
+
 ---
 
-# 20. 正式提交 YARN
+# 32. 提交 YARN
 
-建议先确认配置文件权限：
-
-```bash
-chmod 600 application.properties
-```
-
-然后：
+最简单：
 
 ```bash
+chmod +x run-yarn.sh
 ./run-yarn.sh
 ```
 
-脚本里面最终执行的是：
+脚本会执行：
 
 ```bash
 /home/xgs/flink-1.17.2/bin/flink run-application \
@@ -1141,426 +988,156 @@ chmod 600 application.properties
 
 ---
 
-# 21. `yarn.ship-files` 是干什么的？
+# 33. 为什么 source.parallelism 必须是 1
 
-Flink/YARN container 不一定和你提交命令所在 shell 的当前目录相同。
-
-所以：
-
-```text
--Dyarn.ship-files=/xxx/application.properties
-```
-
-会把配置文件作为 YARN local resource 分发到 container。
-
-程序再通过：
-
-```bash
---config application.properties
-```
-
-读取它。
-
----
-
-# 22. 怎么确认任务真的在运行？
-
-查看 YARN：
-
-```bash
-yarn application -list
-```
-
-应该能看到类似：
-
-```text
-NET-TRAFFIC-ANOMALY
-```
-
-记录它的 application id，例如：
-
-```text
-application_123456789_0010
-```
-
----
-
-# 23. 怎么看日志？
-
-```bash
-yarn logs -applicationId application_123456789_0010
-```
-
-日志中应该周期性看到：
-
-```text
-Start Doris five-minute query
-Doris query progress
-Doris query analyzed
-Window finished
-```
-
-例如：
-
-```text
-Window finished: [2026-08-17 20:05:00, 2026-08-17 20:10:00),
-rows=12345678,
-offHoursRows=12345678,
-alerts=87,
-nextCursor=2026-08-17 20:10:00
-```
-
-看到 `nextCursor` 正常增加，就是持续模式在工作。
-
----
-
-# 24. 怎么只看告警日志？
-
-当前 LocalLogSink 会把告警 JSON 写入日志。
-
-可以：
-
-```bash
-yarn logs -applicationId application_xxx | grep anomalyType
-```
-
-或者根据你环境的日志平台检索。
-
----
-
-# 25. 怎么验证 Kafka？
-
-先打开：
-
-```properties
-alert.output.kafka.enabled=true
-```
-
-配置 broker：
-
-```properties
-kafka.bootstrap.servers=broker1:9092,broker2:9092
-kafka.topic=anomaly_alert
-```
-
-如果服务器装了 Kafka CLI，可以消费：
-
-```bash
-kafka-console-consumer.sh \
-  --bootstrap-server broker1:9092 \
-  --topic anomaly_alert \
-  --from-beginning
-```
-
-看到 JSON 即成功。
-
----
-
-# 26. 怎么停止任务？
-
-查 application id：
-
-```bash
-yarn application -list
-```
-
-强制停止：
-
-```bash
-yarn application -kill application_xxx
-```
-
-生产升级更推荐先做 savepoint，再停止。
-
----
-
-# 27. 如果任务停了 2 小时，怎么补？
-
-假设确认最后成功窗口结束时间是：
-
-```text
-18:30
-```
-
-重新提交前设置：
-
-```properties
-source.start.mode=fixed
-source.start.time=2026-08-17 18:30:00
-```
-
-任务会依次处理：
-
-```text
-18:30~18:35
-18:35~18:40
-18:40~18:45
-...
-```
-
-一直追到最新完整窗口。
-
-追上以后不会退出，而是继续等待未来窗口。
-
----
-
-# 28. 如果一个 5 分钟窗口处理超过 5 分钟怎么办？
-
-程序不会同时并发处理多个窗口。
-
-例如：
-
-```text
-20:00~20:05 处理用了 8 分钟
-```
-
-处理完成后发现：
-
-```text
-20:05~20:10
-```
-
-也已经闭合了，就会立即处理下一窗口，不额外等 5 分钟。
-
-因此它会自动 catch up。
-
-但是如果长期出现：
-
-```text
-每个 5 分钟窗口都需要 8 分钟
-```
-
-那么 backlog 会越来越大，说明吞吐不足，必须优化。
-
----
-
-# 29. 当前最大的性能风险是什么？
-
-不是 Sketch 内存。
-
-更可能是：
-
-```text
-Doris -> 单 JDBC Query -> 单 Source subtask
-```
-
-你的数据量非常大，所以必须观察：
-
-```text
-一个 5 分钟窗口实际查询 + 分析耗时
-```
-
-如果稳定小于 5 分钟，当前方案可以持续跟上。
-
-如果稳定超过 5 分钟，下一步建议做：
-
-```text
-Doris 多分片并发读取
-        |
-每个 shard 计算局部 Sketch
-        |
-merge Sketch
-        |
-输出最终告警
-```
-
-当前版本故意限制：
+当前版本：
 
 ```properties
 source.parallelism=1
 ```
 
-避免没有做 query sharding 时多个 Source 全量重复扫描同一窗口。
+一个 Source 负责严格顺序：
 
-不要直接把它改成 4，否则会把同一个窗口读 4 遍。
+```text
+window1
+window2
+window3
+```
+
+如果直接改成 4：
+
+```text
+4 个 Source 都会执行相同 SQL
+```
+
+会产生重复检测和重复历史更新。
+
+如果以后一个 5 分钟窗口处理时间超过 5 分钟，需要做的是：
+
+```text
+Doris 分片查询
+ -> 每分片局部 Sketch
+ -> Sketch Merge
+ -> 单点历史状态提交
+```
+
+而不是直接改 `source.parallelism=4`。
 
 ---
 
-# 30. 10GB TaskManager 内存够不够？
+# 34. 如何确认 Watermark 正常
 
-检测结构本身通常很小。
-
-默认：
+看日志：
 
 ```text
-CMS 三张表：约 30 MiB
-Candidate heap：20,000 条
-Space-Saving：2,048 条
-T-Digest：远小于全量排序数组
-```
-
-JDBC 使用 streaming ResultSet，所以不会为了 ResultSet 保存几千万条 Java 对象。
-
-10GB 的主要余量会留给：
-
-- Flink runtime
-- JDBC/网络 buffer
-- Kafka connector
-- JVM heap / metaspace
-- 临时对象和 GC
-
----
-
-# 31. 为什么 `-p 1` 暂时保留？
-
-你的原提交命令是：
-
-```text
--p 1
-```
-
-当前实现也要求 Source parallelism=1。
-
-所以第一版先保持：
-
-```bash
--p 1
--ys 1
-```
-
-最容易控制行为。
-
-后续如果确认单源吞吐不够，不应该只简单改 `-p 4`，而应该先实现 Doris 查询分片和 Sketch merge。
-
----
-
-# 32. 常见错误：找不到配置文件
-
-错误类似：
-
-```text
-Config file not found
+Doris data watermark updated:
+maxCollectTime=...
+stableDelay=60m
+safeWindowEnd=...
+cursor=...
 ```
 
 检查：
 
-```bash
-ls -l application.properties
+```text
+safeWindowEnd
 ```
 
-以及 `run-yarn.sh` 中：
+是否明显早于 Doris MAX 约 60 分钟。
+
+---
+
+# 35. 如何确认 5 分钟窗口正常
+
+看：
 
 ```text
--Dyarn.ship-files
---config
+Start Doris five-minute query:
+window=[11:30,11:35)
 ```
 
-是否指向正确文件。
-
----
-
-# 33. 常见错误：Doris 登录失败
-
-错误类似：
+完成：
 
 ```text
-Access denied
+Window finished:
+rows=12345678
+alerts=12
+nextCursor=11:35
 ```
 
-先用 mysql client 测试 9030。
-
-检查：
-
-```properties
-doris.username
-doris.password
-doris.jdbc.url
-```
-
----
-
-# 34. 常见错误：Communications link failure
-
-优先检查：
-
-```bash
-ping 10.166.10.37
-nc -vz 10.166.10.37 9030
-```
-
-如果 YARN container 所在节点无法访问 FE，提交节点能访问也没有用。
-
----
-
-# 35. 常见错误：查询超时
-
-配置：
-
-```properties
-doris.jdbc.query.timeout.seconds=1800
-```
-
-默认 30 分钟。
-
-如果一个 5 分钟查询真的需要几十分钟，不建议只是不断把 timeout 加大。
-
-应该查看 Doris profile 和分区裁剪是否生效。
-
----
-
-# 36. 常见错误：任务一直重启
-
-查看 YARN/TaskManager 日志中的第一条异常。
-
-Source 默认：
-
-```properties
-source.retry.max.failures=10
-```
-
-同一个窗口连续 SQL 失败 10 次后，会让 Flink 任务失败，再由：
-
-```properties
-restart.attempts=20
-restart.delay.seconds=10
-```
-
-控制 Flink restart。
-
----
-
-# 37. 常见问题：为什么一直没有 type=3？
-
-检查当前 collectTime 是否属于：
+下一次应该：
 
 ```text
-工作日 20:00~08:00
-或周末
+[11:35,11:40)
 ```
 
-同时检查：
-
-```properties
-rule.offhours.enabled=true
-```
+不会跳号。
 
 ---
 
-# 38. 常见问题：为什么 type=2 很少？
+# 36. 如何看历史状态是否在增长
 
-默认阈值比较严格：
+每个窗口日志包含：
 
-```properties
-rule.large.bytes.quantile=0.999
-rule.large.bytes.baseline.multiplier=4.0
+```text
+pairHistoryEntries=...
+contextHistoryBuckets=...
 ```
 
-可以先在测试环境降低，例如：
+正常初期：
 
-```properties
-rule.large.bytes.quantile=0.99
-rule.large.pkts.quantile=0.99
-rule.large.bytes.baseline.multiplier=2.0
-rule.large.pkts.baseline.multiplier=2.0
+```text
+pairHistoryEntries 持续增加
 ```
 
-观察告警数量，再逐步调整。
+接近：
 
-不要在生产环境直接大幅降低而不评估告警洪峰。
+```properties
+history.pair.max.entries=200000
+```
+
+后会稳定在上限附近。
+
+Context Bucket 随日期和 Context 数增长，但旧日期会被淘汰。
 
 ---
 
-# 39. 常见问题：candidate.capacity 要不要调大？
+# 37. baseline 仍然很小怎么办
+
+先区分 Pair 是不是有历史。
+
+如果某 Pair 第一次出现：
+
+```text
+sampleCount < 3
+```
+
+baseline 会退化为 Context P50。
+
+网络中大量连接可能只有：
+
+```text
+几十~几百 Bytes
+1~几个 Packet
+```
+
+所以 Context P50 很小并不一定是 bug。
+
+真正判断是否异常还必须同时超过：
+
+```text
+Context P99.9
+```
+
+如果你希望 `baseline_bytes` 更偏向“重流量连接自己的正常值”，可以：
+
+1. 增大 `rule.large.candidate.capacity`，让更多 heavy pair 被学习；
+2. 保持 `history.pair.min.samples=3`；
+3. 运行一段时间，让 Pair EMA 累积。
+
+---
+
+# 38. 如何判断 Candidate Capacity 是否太小
 
 默认：
 
@@ -1568,178 +1145,593 @@ rule.large.pkts.baseline.multiplier=2.0
 rule.large.candidate.capacity=20000
 ```
 
-它决定有多少个最大 bytes 的候选记录能够进入最终 type=2 判断。
+如果一个窗口有极大量重流量 Pair，可能某个重要 Pair 没进入前 2 万。
 
-如果窗口行数特别大，同时 P99.9 尾部记录数远超过 20000，可能有部分尾部连接没有进入候选池。
+可以尝试：
 
-可以提高：
-
-```text
-20000 -> 50000 -> 100000
+```properties
+rule.large.candidate.capacity=50000
 ```
 
-但会增加 heap 和 finalization CPU。
+代价：
+
+```text
+当前窗口堆内存增加
+Pair 更新计算增加
+```
+
+但仍然不会保存全部行。
 
 ---
 
-# 40. 生产上线建议顺序
+# 39. Pair max.entries 怎么调
 
-第一次不要直接：
+默认：
 
 ```properties
-alert.output.kafka.enabled=true
+history.pair.max.entries=200000
 ```
 
-建议：
+如果 TaskManager heap 很充足，而且希望更多 Pair 有自己的 EMA：
 
-### 阶段 1
+```properties
+history.pair.max.entries=500000
+```
+
+不要一上来改成几百万。
+
+先观察：
+
+```text
+TaskManager heap
+GC
+checkpoint duration
+checkpoint size
+```
+
+再调。
+
+---
+
+# 40. stable delay 怎么调
+
+建议观察至少一天。
+
+记录：
+
+```text
+系统时间
+Doris MAX(collectTime)
+空窗口次数
+```
+
+如果 `rows=0` 重试很多：
+
+```text
+stable delay 太小
+```
+
+如果始终没有空窗口但业务觉得告警太晚：
+
+```text
+可以尝试从 60 降到 45 / 30
+```
+
+一次不要调太激进。
+
+---
+
+# 41. Kafka 开关
+
+先只打日志：
 
 ```properties
 alert.output.log.enabled=true
 alert.output.kafka.enabled=false
 ```
 
-跑一段时间，只观察日志。
-
-重点看：
-
-```text
-每窗口 rows
-每窗口 elapsedMs
-每窗口 alerts
-是否有 query retry
-是否有 backlog
-```
-
-### 阶段 2
-
-确认阈值合理后：
+稳定以后：
 
 ```properties
+alert.output.log.enabled=true
 alert.output.kafka.enabled=true
 ```
 
-先接测试 topic。
+Kafka：
 
-### 阶段 3
-
-确认下游消费正常，再切正式 topic。
-
----
-
-# 41. 建议重点监控的指标
-
-Source 注册了 Flink counter：
-
-```text
-processedWindows
-queriedRows
-emittedAlerts
-badRows
-queryFailures
-```
-
-在 Flink metric 系统接入 Prometheus 等系统以后，可以对这些指标做监控。
-
-最重要的是：
-
-```text
-processedWindows 是否持续增加
-queryFailures 是否持续增加
-一个窗口耗时是否 > 5 分钟
+```properties
+kafka.bootstrap.servers=localhost:9092
+kafka.topic=anomaly_alert
 ```
 
 ---
 
-# 42. 配置密码安全
+# 42. 告警 JSON
 
-根目录配置文件目前是部署文件，可能包含真实密码。
+Type 2：
 
-至少执行：
-
-```bash
-chmod 600 application.properties
+```json
+{
+  "logId":"STATIC_NET_TRAFFIC_ALERT",
+  "collectTime":"2026-08-17 11:33:00",
+  "srcIp":"1.1.1.1",
+  "dstIp":"2.2.2.2",
+  "protocol":"TLS",
+  "anomalyType":2,
+  "anomalyDetail":{
+    "current_bytes":10000000,
+    "current_pkts":12000,
+    "baseline_bytes":200000,
+    "baseline_pkts":250
+  },
+  "remark1":"",
+  "remark2":"",
+  "vendorCode":"V001"
+}
 ```
 
-并把它加入 Git 忽略规则。
+Type 3：
 
-不要把真实密码放进：
+```json
+{
+  "anomalyType":3,
+  "anomalyDetail":{
+    "topRank":2,
+    "TopN":100,
+    "conns":156856
+  }
+}
+```
+
+---
+
+# 43. 重要代码文件怎么读
+
+第一次只看以下顺序。
+
+## 43.1 NetTrafficSentinel.java
+
+作用：
+
+```text
+加载配置
+创建 Flink Environment
+开启 checkpoint
+创建 Source
+连接日志/Kafka Sink
+```
+
+## 43.2 DorisPollingAlertSource.java
+
+这是最重要的运行控制类。
+
+负责：
+
+```text
+查询 Doris MAX collectTime
+计算 safe watermark
+控制 nextWindowStart
+执行 5 分钟 SQL
+rows=0 重试
+checkpoint 保存历史
+```
+
+## 43.3 FiveMinuteWindowAnalyzer.java
+
+负责把一行 Doris Metric 同时送入：
+
+```text
+Large Traffic
+Off-hours TopN
+```
+
+## 43.4 HistoricalBaselineStore.java
+
+负责长期状态：
+
+```text
+Context 时间桶
+Pair EMA
+7天过期
+20万容量淘汰
+checkpoint snapshot/restore
+```
+
+## 43.5 LargeTrafficAccumulator.java
+
+只属于当前一个 5 分钟窗口。
+
+保存：
+
+```text
+Context t-digest
+Candidate min-heap
+```
+
+窗口结束后对象即可释放。
+
+## 43.6 LargeTrafficDetector.java
+
+负责：
+
+```text
+读取历史 Context
+读取 Pair EMA
+选择 baseline
+计算阈值
+生成 type=2
+生成允许学习的 PairSample
+```
+
+---
+
+# 44. 内存里不会保存什么
+
+不会保存：
+
+```text
+整个 ResultSet
+5分钟全部 MetricRecord
+全部 srcIp-dstIp HashMap
+7天所有原始记录
+```
+
+JDBC 使用 row streaming：
+
+```text
+ResultSet.next()
+ -> 处理一行
+ -> 更新 Sketch/Heap
+ -> 丢掉原始行
+```
+
+---
+
+# 45. 内存里主要保存什么
+
+长期：
+
+```text
+最多 20万 Pair EMA
+7天 Context t-digest 日期桶
+```
+
+单窗口：
+
+```text
+最多 2万 Candidate MetricRecord
+当前 Context Sketch
+Space-Saving 2048 项
+```
+
+因此内存与配置上限相关，而不是与 5 分钟原始行数线性相关。
+
+---
+
+# 46. checkpoint 失败怎么办
+
+先看日志是否：
+
+```text
+Checkpoint expired before completing
+```
+
+或者 HDFS 权限错误。
+
+首先检查：
+
+```properties
+checkpoint.timeout.ms=600000
+checkpoint.storage.path=hdfs:///...
+```
+
+再检查：
+
+```text
+checkpoint duration
+checkpoint size
+JobManager/TaskManager GC
+HDFS 写入速度
+```
+
+如果 Pair 状态很大，可以：
+
+```properties
+history.pair.max.entries=100000
+```
+
+做对比。
+
+---
+
+# 47. Doris 查询超过 5 分钟怎么办
+
+例如日志：
+
+```text
+elapsedMs=420000
+```
+
+表示一个 5 分钟窗口用了 7 分钟。
+
+长期会追不上。
+
+不要直接：
+
+```properties
+source.parallelism=4
+```
+
+下一阶段需要真正实现：
+
+```text
+按 hash(srcIp) 或 Doris tablet 分片
+        ↓
+多个 JDBC reader
+        ↓
+局部 Candidate/Sketch
+        ↓
+merge
+        ↓
+单次历史提交
+```
+
+---
+
+# 48. 常见日志解释
+
+## No restored cursor
+
+```text
+No restored cursor. Initial Doris window cursor=...
+```
+
+第一次启动/没有恢复 checkpoint，正常。
+
+## Restored historical state
+
+```text
+Restored historical state: pairEntries=..., contextBuckets=...
+```
+
+说明历史基线从 checkpoint/savepoint 恢复。
+
+## Empty window
+
+```text
+Cursor is NOT advanced
+```
+
+新版保护机制，正常但如果频繁发生需调 stable delay。
+
+## Doris operation failed
+
+网络/JDBC/SQL 临时失败。
+
+cursor 不推进，会重试原窗口。
+
+---
+
+# 49. 配置密码安全
+
+根目录：
+
+```text
+application.properties
+```
+
+是运行时外置文件，可以包含真实密码。
+
+JAR 内：
 
 ```text
 src/main/resources/application.properties
 ```
 
-因为 resources 会进入最终 JAR。
+必须使用：
 
-项目里的 classpath 配置使用 `CHANGE_ME_DORIS_PASSWORD` 占位符。
+```properties
+doris.password=CHANGE_ME_DORIS_PASSWORD
+```
+
+否则密码会打进 JAR。
+
+建议服务器：
+
+```bash
+chmod 600 application.properties
+```
 
 ---
 
-# 43. 推荐上线前检查清单
+# 50. 上线前检查清单
 
-- [ ] Java 是 8 或 11
-- [ ] Maven 能正常下载依赖
-- [ ] Flink 是 1.17.2
-- [ ] YARN 可正常提交任务
-- [ ] YARN 节点能访问 Doris FE 9030
-- [ ] Doris 5 分钟查询能命中时间分区/范围
+- [ ] Java 8/11
+- [ ] Maven 正常
+- [ ] Flink 1.17.2
+- [ ] Doris FE 9030 网络可达
+- [ ] Doris 查询账号权限正常
 - [ ] `business.timezone=Asia/Shanghai`
-- [ ] `source.parallelism=1`
 - [ ] `window.size.minutes=5`
-- [ ] `checkpoint.storage.path` 已配置到可用 HDFS
-- [ ] 首次上线只开日志输出观察
-- [ ] Kafka broker/topic 已确认
-- [ ] 配置文件权限为 600
-- [ ] 一个 5 分钟窗口能够在 5 分钟以内稳定处理完
+- [ ] `source.parallelism=1`
+- [ ] `source.doris.stable.delay.minutes` 已按真实延迟配置
+- [ ] `source.empty.window.advance=false`
+- [ ] `checkpoint.storage.path` 已设置 HDFS
+- [ ] 初次上线 Kafka 先关闭
+- [ ] 一个 5 分钟窗口处理时间小于 5 分钟
+- [ ] 观察 `pairHistoryEntries`
+- [ ] 观察 `contextHistoryBuckets`
+- [ ] 观察 checkpoint duration/size
+- [ ] 观察 Watermark 是否持续前进
 
 ---
 
-# 44. 一句话理解整个项目
+# 51. 推荐第一版生产配置
 
-这个程序本质上就是：
+```properties
+window.size.minutes=5
 
-```text
-一个永不退出的 Flink YARN Application
-        +
-一个带 checkpoint 游标的 5 分钟 Doris JDBC Poller
-        +
-固定内存的 T-Digest / Count-Min Sketch / Space-Saving
-        +
-日志和 Kafka 告警 Sink
+source.start.mode=fixed
+# 改成你确认需要重新补算的起始时间
+source.start.time=2026-08-15 00:00:00
+source.watermark.poll.interval.seconds=60
+source.watermark.lookback.days=3
+source.doris.stable.delay.minutes=60
+source.empty.window.advance=false
+source.empty.window.retry.seconds=300
+source.parallelism=1
+
+rule.large.candidate.capacity=20000
+rule.large.bytes.quantile=0.999
+rule.large.pkts.quantile=0.999
+
+history.context.retention.days=7
+history.context.slot.minutes=5
+history.context.min.days=2
+history.context.tdigest.compression=100
+
+history.pair.ttl.days=7
+history.pair.max.entries=200000
+history.pair.ema.alpha=0.10
+history.pair.min.samples=3
+
+alert.output.log.enabled=true
+alert.output.kafka.enabled=false
+
+checkpoint.enabled=true
+checkpoint.interval.ms=300000
+checkpoint.timeout.ms=600000
+checkpoint.storage.path=hdfs:///flink-checkpoints/net-traffic-sentinel
 ```
 
-第一次排查问题时，不要一次看所有类。
+追上以后再：
 
-按下面顺序看即可：
-
-```text
-NetTrafficSentinel.java
-        ↓
-DorisPollingAlertSource.java
-        ↓
-FiveMinuteWindowAnalyzer.java
-        ↓
-LargeTrafficDetector.java / OffHoursDetector.java
-        ↓
-KafkaSinkFactory.java / LocalLogSink.java
+```properties
+alert.output.kafka.enabled=true
 ```
-
 
 ---
 
-# 45. 官方参考资料
+# 52. 最后一句话理解新版
 
-下面这些官方文档对应本工程最关键的兼容性与实现选择：
+```text
+Doris 的真实数据进度决定“什么时候查”
+        +
+7天 Context Sketch 决定“同类流量通常多大”
+        +
+有限 Pair EMA 决定“这个连接自己通常多大”
+        +
+5分钟 Space-Saving 决定“非工作时段谁最活跃”
+        +
+Flink checkpoint 保存 cursor 和历史基线
+```
 
-- Apache Doris 2.1 Flink Doris Connector：说明 Doris Source 当前是 bounded stream，不支持 CDC 式持续读取，并说明读取字段/过滤条件的能力。
-  https://doris.apache.org/docs/2.1/ecosystem/flink-doris-connector/
-- Apache Doris 2.1 MySQL Protocol：说明 Doris FE query port 可使用 MySQL/JDBC 生态连接。
-  https://doris.apache.org/docs/2.1/db-connect/database-connect/
-- MySQL Connector/J ResultSet：说明 forward-only + read-only + `Integer.MIN_VALUE` fetch size 的 row streaming 模式。
-  https://dev.mysql.com/doc/connectors/en/connector-j-reference-implementation-notes.html
-- Flink 1.17 SourceFunction API：自定义 Source 与 checkpoint lock 的基础接口。
-  https://nightlies.apache.org/flink/flink-docs-release-1.17/api/java/org/apache/flink/streaming/api/functions/source/SourceFunction.html
-- Flink 1.17 Checkpoints：checkpoint storage、HDFS/FileSystemCheckpointStorage 与 retained checkpoint。
-  https://nightlies.apache.org/flink/flink-docs-release-1.17/docs/ops/state/checkpoints/
-- Flink 1.17 Kafka Sink：AT_LEAST_ONCE / EXACTLY_ONCE 与 transactional id。
-  https://nightlies.apache.org/flink/flink-docs-release-1.17/docs/connectors/datastream/kafka/
+这就是新版 NetTrafficSentinel 的核心。
+
+---
+
+# 26. 从旧版升级到本版本时怎么做
+
+这一节非常重要。
+
+旧版状态主要是：
+
+```text
+nextWindowStart
+```
+
+本版本状态变成：
+
+```text
+nextWindowStart
++ Context t-digest 日期桶
++ Pair EMA 历史
+```
+
+而且状态名称和 Operator UID 使用了 V2 名称。因此，第一次切换到这个版本时，最简单、最不容易出错的方法是把它当作一个新的 YARN Application 启动。
+
+## 26.1 推荐升级步骤
+
+先停止旧任务。
+
+然后在 Doris 中找一个你确认已经有完整数据的 5 分钟时间边界，例如：
+
+```text
+2026-08-15 20:00:00
+```
+
+修改：
+
+```properties
+source.start.mode=fixed
+source.start.time=2026-08-15 20:00:00
+```
+
+重新提交 V2。
+
+程序会：
+
+```text
+20:00~20:05
+20:05~20:10
+20:10~20:15
+...
+```
+
+一直补到 Doris 的安全 Watermark，然后自动等待后续数据。
+
+当 V2 已经稳定运行并产生自己的 checkpoint/savepoint 后，以后的 V2 重启再使用 V2 自己的状态恢复。
+
+## 26.2 不想补历史怎么办
+
+配置：
+
+```properties
+source.start.mode=latest_data
+```
+
+程序会先查询 Doris：
+
+```sql
+MAX(collectTime)
+```
+
+减去：
+
+```properties
+source.doris.stable.delay.minutes
+```
+
+得到安全 Watermark，然后从安全 Watermark 前一个完整 5 分钟窗口开始。
+
+## 26.3 配置文件密码安全
+
+项目根目录的：
+
+```text
+application.properties
+```
+
+是实际部署用的外置配置文件，当前包含你提供的 Doris 连接配置。
+
+而：
+
+```text
+src/main/resources/application.properties
+```
+
+使用：
+
+```properties
+doris.password=CHANGE_ME_DORIS_PASSWORD
+```
+
+不要把带真实密码的外置配置上传到 GitHub、GitLab 等公共仓库。
+
+Linux 上可以执行：
+
+```bash
+chmod 600 application.properties
+```
+
+让配置文件仅对当前账号可读写。

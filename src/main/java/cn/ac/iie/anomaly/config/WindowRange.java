@@ -1,10 +1,8 @@
 package cn.ac.iie.anomaly.config;
 
 import java.io.Serializable;
-import java.time.Clock;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 
@@ -31,32 +29,13 @@ public final class WindowRange implements Serializable {
         return new WindowRange(start, start.plusMinutes(sizeMinutes), zoneId);
     }
 
-    /**
-     * Returns the end timestamp of the newest window that is safe to read.
-     * Example: size=5, delay=1, business time=20:11:20 -> 20:10:00.
-     */
-    public static LocalDateTime latestClosedEnd(AppConfig config, Clock clock) {
-        ZoneId zone = ZoneId.of(config.get("business.timezone", "Asia/Shanghai"));
-        int sizeMinutes = config.getInt("window.size.minutes", 5);
-        int delayMinutes = config.getInt("window.delay.minutes", 1);
-        ZonedDateTime effective = ZonedDateTime.now(clock).withZoneSameInstant(zone).minusMinutes(delayMinutes);
-        int flooredMinute = (effective.getMinute() / sizeMinutes) * sizeMinutes;
-        return effective.withMinute(flooredMinute).withSecond(0).withNano(0).toLocalDateTime();
-    }
-
-    /** Starting cursor when no checkpoint state exists. */
-    public static LocalDateTime initialStart(AppConfig config, Clock clock) {
-        int sizeMinutes = config.getInt("window.size.minutes", 5);
-        String mode = config.get("source.start.mode", "latest_closed");
-        if ("latest_closed".equalsIgnoreCase(mode)) {
-            return latestClosedEnd(config, clock).minusMinutes(sizeMinutes);
+    /** Floors a business-local timestamp to the previous N-minute boundary. */
+    public static LocalDateTime floorToWindow(LocalDateTime time, int sizeMinutes) {
+        if (sizeMinutes <= 0 || 60 % sizeMinutes != 0) {
+            throw new IllegalArgumentException("sizeMinutes must be a positive divisor of 60");
         }
-        if ("fixed".equalsIgnoreCase(mode)) {
-            LocalDateTime start = LocalDateTime.parse(config.get("source.start.time"), DATETIME);
-            validateAlignment(start, sizeMinutes);
-            return start;
-        }
-        throw new IllegalArgumentException("Unsupported source.start.mode: " + mode);
+        int flooredMinute = (time.getMinute() / sizeMinutes) * sizeMinutes;
+        return time.withMinute(flooredMinute).withSecond(0).withNano(0);
     }
 
     public static void validateAlignment(LocalDateTime time, int sizeMinutes) {

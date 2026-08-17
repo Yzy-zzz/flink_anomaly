@@ -1,16 +1,23 @@
 package cn.ac.iie.anomaly.rule;
 
 import cn.ac.iie.anomaly.config.AppConfig;
+import cn.ac.iie.anomaly.history.ContextStats;
+import cn.ac.iie.anomaly.history.HistoricalBaselineStore;
 import cn.ac.iie.anomaly.model.AlertRecord;
 import cn.ac.iie.anomaly.model.MetricRecord;
+import cn.ac.iie.anomaly.util.ConnectionKey;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
-/** Finalizes a bounded LargeTrafficAccumulator into type=2 alerts. */
+/** Large-traffic detection using historical context sketches + bounded pair EMA history. */
 public final class LargeTrafficDetector implements Serializable {
     private static final long serialVersionUID = 1L;
 
@@ -36,79 +43,123 @@ public final class LargeTrafficDetector implements Serializable {
         this.remark2 = config.get("alert.remark2", "");
     }
 
-    public List<AlertRecord> detect(LargeTrafficAccumulator acc) {
-        List<AlertRecord> alerts = new ArrayList<>();
-        if (acc == null || acc.getRowCount() == 0L) {
-            return alerts;
+    public DetectionResult detect(LargeTrafficAccumulator acc, HistoricalBaselineStore historyStore) {
+        List<LargeTrafficAccumulator.Candidate> candidates = acc.candidateSnapshot();
+        if (candidates.isEmpty()) {
+            return new DetectionResult(Collections.<AlertRecord>emptyList(),
+                    Collections.<HistoricalBaselineStore.PairSample>emptyList());
         }
 
-        double pBytes = safeQuantile(acc.getBytesDigest().quantile(bytesQuantile));
-        double pPkts = safeQuantile(acc.getPktsDigest().quantile(pktsQuantile));
-        double medianBytes = safeQuantile(acc.getBytesDigest().quantile(0.5d));
-        double medianPkts = safeQuantile(acc.getPktsDigest().quantile(0.5d));
+        Map<String, AlertWithBytes> bestAlertByPair = new HashMap<>();
+        Set<Long> anomalousPairHashes = new HashSet<>();
 
-        // Deduplication is only over the fixed-size candidate heap, not the full IP-pair cardinality.
-        Map<String, MetricRecord> bestByPair = new HashMap<>();
-        for (MetricRecord candidate : acc.candidateSnapshot()) {
-            String key = candidate.pairKey();
-            MetricRecord old = bestByPair.get(key);
-            if (old == null || candidate.totalBytes() > old.totalBytes()) {
-                bestByPair.put(key, candidate);
-            }
-        }
-
-        for (Map.Entry<String, MetricRecord> entry : bestByPair.entrySet()) {
-            String key = entry.getKey();
-            MetricRecord candidate = entry.getValue();
-            long currentBytes = candidate.totalBytes();
-            long currentPkts = candidate.totalPkts();
-
-            if (currentBytes <= pBytes) {
+        for (LargeTrafficAccumulator.Candidate candidate : candidates) {
+            MetricRecord record = candidate.getRecord();
+            ContextStats context = effectiveContext(acc, candidate.getContextKey());
+            if (context.getThresholdBytes() <= 0L) {
                 continue;
             }
 
-            long estimatedCount = acc.getCountSketch().estimate(key);
-            long baselineBytes = estimateExcludingCurrent(
-                    acc.getByteSumSketch().estimate(key), estimatedCount, currentBytes, medianBytes);
-            long baselinePkts = estimateExcludingCurrent(
-                    acc.getPktSumSketch().estimate(key), estimatedCount, currentPkts, medianPkts);
+            String pairKey = record.pairKey();
+            long pairHash = ConnectionKey.hash64(pairKey);
+            HistoricalBaselineStore.PairStats pair = historyStore.pairStats(pairHash, record.getCollectTimestamp());
 
-            double bytesThreshold = Math.max(pBytes, baselineBytes * bytesBaselineMultiplier);
-            double pktsThreshold = Math.max(pPkts, baselinePkts * pktsBaselineMultiplier);
+            long baselineBytes;
+            long baselinePkts;
+            if (pair != null && pair.getSampleCount() >= historyStore.getPairMinSamples()) {
+                baselineBytes = positiveRound(pair.getEmaBytes(), context.getP50Bytes());
+                baselinePkts = positiveRound(pair.getEmaPkts(), context.getP50Pkts());
+            } else {
+                baselineBytes = context.getP50Bytes();
+                baselinePkts = context.getP50Pkts();
+            }
+
+            long currentBytes = record.totalBytes();
+            long currentPkts = record.totalPkts();
+            double bytesThreshold = Math.max((double) context.getThresholdBytes(),
+                    baselineBytes * bytesBaselineMultiplier);
+            double pktsThreshold = Math.max((double) context.getThresholdPkts(),
+                    baselinePkts * pktsBaselineMultiplier);
 
             boolean bytesAnomaly = currentBytes > bytesThreshold;
             boolean pktsAnomaly = currentPkts > pktsThreshold;
-            boolean extremeBytes = currentBytes > pBytes * extremeMultiplier;
+            boolean extremeBytes = currentBytes > context.getThresholdBytes() * extremeMultiplier;
 
             if (bytesAnomaly && (pktsAnomaly || extremeBytes)) {
-                alerts.add(AlertRecord.largeTraffic(
-                        logId, vendorCode, remark1, remark2, candidate, baselineBytes, baselinePkts));
+                anomalousPairHashes.add(pairHash);
+                AlertRecord alert = AlertRecord.largeTraffic(
+                        logId, vendorCode, remark1, remark2, record, baselineBytes, baselinePkts);
+                AlertWithBytes old = bestAlertByPair.get(pairKey);
+                if (old == null || currentBytes > old.currentBytes) {
+                    bestAlertByPair.put(pairKey, new AlertWithBytes(alert, currentBytes));
+                }
             }
         }
-        return alerts;
-    }
 
-    private static long estimateExcludingCurrent(long estimatedSum, long estimatedCount,
-                                                 long current, double globalMedian) {
-        if (estimatedCount <= 1L) {
-            return clampDoubleToLong(globalMedian);
+        List<AlertRecord> alerts = new ArrayList<>(bestAlertByPair.size());
+        for (AlertWithBytes value : bestAlertByPair.values()) {
+            alerts.add(value.alert);
         }
-        long adjusted = estimatedSum <= current ? 0L : estimatedSum - current;
-        long baseline = adjusted / Math.max(1L, estimatedCount - 1L);
-        return baseline <= 0L ? clampDoubleToLong(globalMedian) : baseline;
+
+        // Pair EMA learns only from bounded heavy candidates and never learns from a pair
+        // that was anomalous anywhere in this five-minute window.
+        List<LargeTrafficAccumulator.Candidate> chronological = new ArrayList<>(candidates);
+        chronological.sort(new Comparator<LargeTrafficAccumulator.Candidate>() {
+            @Override
+            public int compare(LargeTrafficAccumulator.Candidate a, LargeTrafficAccumulator.Candidate b) {
+                return Long.compare(a.getRecord().getCollectTimestamp(), b.getRecord().getCollectTimestamp());
+            }
+        });
+
+        List<HistoricalBaselineStore.PairSample> pairSamples = new ArrayList<>();
+        for (LargeTrafficAccumulator.Candidate candidate : chronological) {
+            MetricRecord record = candidate.getRecord();
+            long pairHash = ConnectionKey.hash64(record.pairKey());
+            if (anomalousPairHashes.contains(pairHash)) {
+                continue;
+            }
+            pairSamples.add(new HistoricalBaselineStore.PairSample(
+                    pairHash, record.totalBytes(), record.totalPkts(), record.getCollectTimestamp()));
+        }
+
+        return new DetectionResult(alerts, pairSamples);
     }
 
-    private static double safeQuantile(double value) {
-        return Double.isFinite(value) && value >= 0d ? value : 0d;
+    private ContextStats effectiveContext(LargeTrafficAccumulator acc, String contextKey) {
+        ContextStats historical = acc.historicalStats(contextKey);
+        if (historical.isUsable()) {
+            return historical;
+        }
+        // Cold start: use this window's own distribution until enough historical dates exist.
+        return acc.currentStats(contextKey, bytesQuantile, pktsQuantile);
     }
 
-    private static long clampDoubleToLong(double value) {
+    private static long positiveRound(double value, long fallback) {
         if (!Double.isFinite(value) || value <= 0d) {
-            return 0L;
+            return fallback;
         }
-        if (value >= Long.MAX_VALUE) {
-            return Long.MAX_VALUE;
+        return value >= Long.MAX_VALUE ? Long.MAX_VALUE : Math.round(value);
+    }
+
+    private static final class AlertWithBytes {
+        private final AlertRecord alert;
+        private final long currentBytes;
+        private AlertWithBytes(AlertRecord alert, long currentBytes) {
+            this.alert = alert;
+            this.currentBytes = currentBytes;
         }
-        return Math.round(value);
+    }
+
+    public static final class DetectionResult {
+        private final List<AlertRecord> alerts;
+        private final List<HistoricalBaselineStore.PairSample> pairSamples;
+
+        private DetectionResult(List<AlertRecord> alerts, List<HistoricalBaselineStore.PairSample> pairSamples) {
+            this.alerts = alerts;
+            this.pairSamples = pairSamples;
+        }
+
+        public List<AlertRecord> getAlerts() { return alerts; }
+        public List<HistoricalBaselineStore.PairSample> getPairSamples() { return pairSamples; }
     }
 }

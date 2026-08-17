@@ -1,8 +1,10 @@
 package cn.ac.iie.anomaly.rule;
 
 import cn.ac.iie.anomaly.config.AppConfig;
+import cn.ac.iie.anomaly.history.HistoricalBaselineStore;
 import cn.ac.iie.anomaly.model.AlertRecord;
 import cn.ac.iie.anomaly.model.MetricRecord;
+import cn.ac.iie.anomaly.config.WindowRange;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -34,8 +36,10 @@ public class FiveMinuteWindowAnalyzerTest {
         Files.write(file, props.getBytes(StandardCharsets.UTF_8));
         try {
             AppConfig config = AppConfig.load(new String[]{"--config", file.toString()});
-            FiveMinuteWindowAnalyzer analyzer = new FiveMinuteWindowAnalyzer(config);
             ZoneId zone = ZoneId.of("Asia/Shanghai");
+            WindowRange window = WindowRange.fromStart(LocalDateTime.of(2026, 8, 17, 21, 0), 5, zone);
+            FiveMinuteWindowAnalyzer analyzer = new FiveMinuteWindowAnalyzer(
+                    config, new HistoricalBaselineStore(config), window);
             for (int i = 0; i < 10; i++) {
                 LocalDateTime time = LocalDateTime.of(2026, 8, 17, 21, i % 5);
                 String text = time.format(F);
@@ -44,7 +48,7 @@ public class FiveMinuteWindowAnalyzerTest {
                         "10.0.0." + (i % 3), "10.0.1.1", "TCP",
                         i + 1, 1, 1, 10, 10), time);
             }
-            List<AlertRecord> alerts = analyzer.finish();
+            List<AlertRecord> alerts = analyzer.finish().getAlerts();
             Assert.assertEquals(2, alerts.size());
             Assert.assertEquals(3, alerts.get(0).getAnomalyType());
             Assert.assertEquals(3, alerts.get(1).getAnomalyType());

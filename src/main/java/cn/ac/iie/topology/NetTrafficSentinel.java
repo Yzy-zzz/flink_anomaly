@@ -43,22 +43,24 @@ public class NetTrafficSentinel {
 
         DataStreamSource<AlertRecord> alerts = env.addSource(new DorisPollingAlertSource(config));
         alerts.name("doris-five-minute-polling-source");
+        alerts.uid("doris-five-minute-polling-source-v2");
         alerts.setParallelism(config.getInt("source.parallelism", 1));
 
         SingleOutputStreamOperator<String> jsonAlerts = alerts
                 .map(new AlertJsonMapper())
-                .name("alert-to-json");
+                .name("alert-to-json")
+                .uid("alert-to-json-v2");
 
         boolean logEnabled = config.getBoolean("alert.output.log.enabled", true);
         boolean kafkaEnabled = config.getBoolean("alert.output.kafka.enabled", false);
         if (logEnabled) {
-            jsonAlerts.addSink(new LocalLogSink()).name("alert-local-log");
+            jsonAlerts.addSink(new LocalLogSink()).name("alert-local-log").uid("alert-local-log-v2");
         }
         if (kafkaEnabled) {
-            jsonAlerts.sinkTo(KafkaSinkFactory.create(config)).name("alert-kafka");
+            jsonAlerts.sinkTo(KafkaSinkFactory.create(config)).name("alert-kafka").uid("alert-kafka-v2");
         }
         if (!logEnabled && !kafkaEnabled) {
-            jsonAlerts.addSink(new NoOpStringSink()).name("alert-noop");
+            jsonAlerts.addSink(new NoOpStringSink()).name("alert-noop").uid("alert-noop-v2");
         }
 
         env.execute(config.get("job.name", "NET-TRAFFIC-ANOMALY"));
@@ -77,10 +79,10 @@ public class NetTrafficSentinel {
             return;
         }
 
-        env.enableCheckpointing(config.getLong("checkpoint.interval.ms", 60000L), CheckpointingMode.EXACTLY_ONCE);
+        env.enableCheckpointing(config.getLong("checkpoint.interval.ms", 300000L), CheckpointingMode.EXACTLY_ONCE);
         CheckpointConfig checkpointConfig = env.getCheckpointConfig();
-        checkpointConfig.setCheckpointTimeout(config.getLong("checkpoint.timeout.ms", 300000L));
-        checkpointConfig.setMinPauseBetweenCheckpoints(config.getLong("checkpoint.min.pause.ms", 10000L));
+        checkpointConfig.setCheckpointTimeout(config.getLong("checkpoint.timeout.ms", 600000L));
+        checkpointConfig.setMinPauseBetweenCheckpoints(config.getLong("checkpoint.min.pause.ms", 30000L));
         checkpointConfig.setMaxConcurrentCheckpoints(1);
         checkpointConfig.setExternalizedCheckpointCleanup(
                 CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
@@ -124,6 +126,37 @@ public class NetTrafficSentinel {
         }
         if (config.getInt("rule.large.candidate.capacity", 20000) <= 0) {
             throw new IllegalArgumentException("rule.large.candidate.capacity must be positive");
+        }
+
+        int contextSlot = config.getInt("history.context.slot.minutes", 5);
+        if (contextSlot <= 0 || 60 % contextSlot != 0) {
+            throw new IllegalArgumentException("history.context.slot.minutes must be a positive divisor of 60");
+        }
+        if (config.getInt("history.context.retention.days", 7) <= 0) {
+            throw new IllegalArgumentException("history.context.retention.days must be positive");
+        }
+        int contextMinDays = config.getInt("history.context.min.days", 2);
+        if (contextMinDays <= 0 || contextMinDays > config.getInt("history.context.retention.days", 7)) {
+            throw new IllegalArgumentException("history.context.min.days must be in [1, retention.days]");
+        }
+        if (config.getInt("history.pair.ttl.days", 7) <= 0) {
+            throw new IllegalArgumentException("history.pair.ttl.days must be positive");
+        }
+        if (config.getInt("history.pair.max.entries", 200000) < 1000) {
+            throw new IllegalArgumentException("history.pair.max.entries must be >= 1000");
+        }
+        double alpha = config.getDouble("history.pair.ema.alpha", 0.10d);
+        if (alpha <= 0d || alpha > 1d) {
+            throw new IllegalArgumentException("history.pair.ema.alpha must be in (0,1]");
+        }
+        if (config.getInt("source.doris.stable.delay.minutes", 60) < 0) {
+            throw new IllegalArgumentException("source.doris.stable.delay.minutes must be >= 0");
+        }
+        String startMode = config.get("source.start.mode", "latest_data");
+        if (!"latest_data".equalsIgnoreCase(startMode)
+                && !"latest_closed".equalsIgnoreCase(startMode)
+                && !"fixed".equalsIgnoreCase(startMode)) {
+            throw new IllegalArgumentException("source.start.mode must be latest_data or fixed");
         }
     }
 }
