@@ -1,0 +1,6 @@
+/target/
+*.log
+.idea/
+*.iml
+# Deployment file may contain real Doris/Kafka credentials.
+/application.properties
