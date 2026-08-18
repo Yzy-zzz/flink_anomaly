@@ -583,15 +583,25 @@ history.pair.max.entries=200000
 
 # 18. 异常 Pair 是否更新 EMA
 
-不更新。
+受限更新。
 
 如果某 Pair 在当前 5 分钟窗口内任何 Candidate 被判断为 type=2：
 
 ```text
-该 Pair 当前整个窗口都不回灌 EMA
+Pair samples < history.pair.min.samples
+    -> 冷启动受限学习：bytes/pkts cap 到有效 Context 高分位阈值后再写 EMA
+
+Pair samples >= history.pair.min.samples
+    -> 当前整个窗口都不回灌 EMA
 ```
 
-这样攻击持续 5 次也不会因为连续把异常值加入 EMA 而迅速提高 baseline。
+默认开关：
+
+```properties
+history.pair.bootstrap.anomaly.capped.learning.enabled=true
+```
+
+这样解决“新 Pair 一触发异常就永远没有样本”的自锁，同时成熟 Pair 仍不会直接吸收异常大值。
 
 ---
 
@@ -1261,8 +1271,31 @@ Type 2：
   "anomalyDetail":{
     "current_bytes":10000000,
     "current_pkts":12000,
+    "baseline_source":"PAIR_EMA",
     "baseline_bytes":200000,
-    "baseline_pkts":250
+    "baseline_pkts":250,
+    "pair_sample_count":5,
+    "pair_min_samples":3,
+    "context_source":"HISTORICAL",
+    "context_historical_days":5,
+    "context_p50_bytes":100,
+    "context_p50_pkts":1,
+    "context_p90_bytes":80000,
+    "context_p90_pkts":120,
+    "context_bytes_quantile":0.999,
+    "context_pkts_quantile":0.999,
+    "context_high_quantile_bytes":1500000,
+    "context_high_quantile_pkts":1800,
+    "bytes_baseline_multiplier":4.0,
+    "pkts_baseline_multiplier":4.0,
+    "bytes_threshold":1500000.0,
+    "pkts_threshold":1800.0,
+    "extreme_multiplier":2.0,
+    "extreme_bytes_threshold":3000000.0,
+    "bytes_anomaly":true,
+    "pkts_anomaly":true,
+    "extreme_bytes":true,
+    "pair_learning_mode":"SKIP_ANOMALOUS_MATURE"
   },
   "remark1":"",
   "remark2":"",

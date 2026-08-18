@@ -265,28 +265,34 @@ rule.large.candidate.capacity=20000
 7 天事件时间 TTL
 ```
 
-### 5.5 异常 Pair 不回灌 EMA
+### 5.5 异常 Pair 的受限学习
 
-流程：
+为了避免新 Pair 第一次就触发 type=2 后永远无法积累 Pair EMA，当前逻辑区分冷启动和成熟 Pair：
 
 ```text
-读旧 baseline
-    ↓
-判断当前窗口
-    ↓
-如果该 Pair 任意候选触发 type=2
-    ↓
-这个 Pair 整个窗口都不更新 EMA
+Pair samples < history.pair.min.samples
+    + 当前触发 type=2
+    -> 允许学习，但 bytes/pkts 分别 cap 到有效 Context 的高分位阈值
+
+Pair samples >= history.pair.min.samples
+    + 当前触发 type=2
+    -> 不更新 Pair EMA
 ```
 
-避免异常流量持续几次后系统“习惯异常”。
+默认开关：
+
+```properties
+history.pair.bootstrap.anomaly.capped.learning.enabled=true
+```
+
+这样既能让冷启动 Pair 逐步获得自己的 EMA，又继续阻止成熟 Pair 直接吸收异常大值。
 
 ### 5.6 baseline_bytes 的含义
 
 优先级：
 
 ```text
-Pair normal samples >= 3
+Pair bounded samples >= 3
     -> baseline = Pair EMA
 
 否则 Context 历史已经成熟

@@ -21,11 +21,22 @@ import java.util.Set;
 public final class LargeTrafficDetector implements Serializable {
     private static final long serialVersionUID = 1L;
 
+    private static final String BASELINE_PAIR_EMA = "PAIR_EMA";
+    private static final String BASELINE_HISTORICAL_CONTEXT = "HISTORICAL_CONTEXT_P50";
+    private static final String BASELINE_CURRENT_CONTEXT = "CURRENT_CONTEXT_P50";
+    private static final String CONTEXT_HISTORICAL = "HISTORICAL";
+    private static final String CONTEXT_CURRENT_WINDOW = "CURRENT_WINDOW";
+    private static final String LEARNING_NORMAL = "NORMAL";
+    private static final String LEARNING_CAPPED_BOOTSTRAP = "CAPPED_BOOTSTRAP";
+    private static final String LEARNING_SKIP_ANOMALOUS_MATURE = "SKIP_ANOMALOUS_MATURE";
+    private static final String LEARNING_SKIP_ANOMALOUS = "SKIP_ANOMALOUS";
+
     private final double bytesQuantile;
     private final double pktsQuantile;
     private final double bytesBaselineMultiplier;
     private final double pktsBaselineMultiplier;
     private final double extremeMultiplier;
+    private final boolean bootstrapAnomalyCappedLearningEnabled;
     private final String logId;
     private final String vendorCode;
     private final String remark1;
@@ -37,6 +48,8 @@ public final class LargeTrafficDetector implements Serializable {
         this.bytesBaselineMultiplier = config.getDouble("rule.large.bytes.baseline.multiplier", 4d);
         this.pktsBaselineMultiplier = config.getDouble("rule.large.pkts.baseline.multiplier", 4d);
         this.extremeMultiplier = config.getDouble("rule.large.extreme.multiplier", 2d);
+        this.bootstrapAnomalyCappedLearningEnabled = config.getBoolean(
+                "history.pair.bootstrap.anomaly.capped.learning.enabled", true);
         this.logId = config.get("alert.logid", "STATIC_LOG_ID");
         this.vendorCode = config.get("alert.vendorCode", "V001");
         this.remark1 = config.get("alert.remark1", "");
@@ -52,10 +65,13 @@ public final class LargeTrafficDetector implements Serializable {
 
         Map<String, AlertWithBytes> bestAlertByPair = new HashMap<>();
         Set<Long> anomalousPairHashes = new HashSet<>();
+        Map<Long, BootstrapLearningCap> bootstrapLearningCaps = new HashMap<>();
+        int pairMinSamples = historyStore.getPairMinSamples();
 
         for (LargeTrafficAccumulator.Candidate candidate : candidates) {
             MetricRecord record = candidate.getRecord();
-            ContextStats context = effectiveContext(acc, candidate.getContextKey());
+            ContextSelection contextSelection = effectiveContext(acc, candidate.getContextKey());
+            ContextStats context = contextSelection.stats;
             if (context.getThresholdBytes() <= 0L) {
                 continue;
             }
@@ -63,15 +79,21 @@ public final class LargeTrafficDetector implements Serializable {
             String pairKey = record.pairKey();
             long pairHash = ConnectionKey.hash64(pairKey);
             HistoricalBaselineStore.PairStats pair = historyStore.pairStats(pairHash, record.getCollectTimestamp());
+            long pairSampleCount = pair == null ? 0L : pair.getSampleCount();
+            boolean pairMature = pair != null && pairSampleCount >= pairMinSamples;
 
             long baselineBytes;
             long baselinePkts;
-            if (pair != null && pair.getSampleCount() >= historyStore.getPairMinSamples()) {
+            String baselineSource;
+            if (pairMature) {
                 baselineBytes = positiveRound(pair.getEmaBytes(), context.getP50Bytes());
                 baselinePkts = positiveRound(pair.getEmaPkts(), context.getP50Pkts());
+                baselineSource = BASELINE_PAIR_EMA;
             } else {
                 baselineBytes = context.getP50Bytes();
                 baselinePkts = context.getP50Pkts();
+                baselineSource = contextSelection.historicalUsable
+                        ? BASELINE_HISTORICAL_CONTEXT : BASELINE_CURRENT_CONTEXT;
             }
 
             long currentBytes = record.totalBytes();
@@ -80,15 +102,61 @@ public final class LargeTrafficDetector implements Serializable {
                     baselineBytes * bytesBaselineMultiplier);
             double pktsThreshold = Math.max((double) context.getThresholdPkts(),
                     baselinePkts * pktsBaselineMultiplier);
+            double extremeBytesThreshold = ((double) context.getThresholdBytes()) * extremeMultiplier;
 
             boolean bytesAnomaly = currentBytes > bytesThreshold;
             boolean pktsAnomaly = currentPkts > pktsThreshold;
-            boolean extremeBytes = currentBytes > context.getThresholdBytes() * extremeMultiplier;
+            boolean extremeBytes = currentBytes > extremeBytesThreshold;
 
             if (bytesAnomaly && (pktsAnomaly || extremeBytes)) {
                 anomalousPairHashes.add(pairHash);
+
+                String pairLearningMode;
+                Long pairLearningCapBytes = null;
+                Long pairLearningCapPkts = null;
+                if (!pairMature && bootstrapAnomalyCappedLearningEnabled) {
+                    long capBytes = learningCap(context.getThresholdBytes(), baselineBytes, currentBytes);
+                    long capPkts = learningCap(context.getThresholdPkts(), baselinePkts, currentPkts);
+                    bootstrapLearningCaps.put(pairHash, new BootstrapLearningCap(capBytes, capPkts));
+                    pairLearningMode = LEARNING_CAPPED_BOOTSTRAP;
+                    pairLearningCapBytes = capBytes;
+                    pairLearningCapPkts = capPkts;
+                } else if (pairMature) {
+                    pairLearningMode = LEARNING_SKIP_ANOMALOUS_MATURE;
+                } else {
+                    pairLearningMode = LEARNING_SKIP_ANOMALOUS;
+                }
+
+                AlertRecord.LargeTrafficEvidence evidence = new AlertRecord.LargeTrafficEvidence(
+                        baselineSource,
+                        baselineBytes,
+                        baselinePkts,
+                        pairSampleCount,
+                        pairMinSamples,
+                        contextSelection.historicalUsable ? CONTEXT_HISTORICAL : CONTEXT_CURRENT_WINDOW,
+                        contextSelection.historicalDays,
+                        context.getP50Bytes(),
+                        context.getP50Pkts(),
+                        context.getP90Bytes(),
+                        context.getP90Pkts(),
+                        bytesQuantile,
+                        pktsQuantile,
+                        context.getThresholdBytes(),
+                        context.getThresholdPkts(),
+                        bytesBaselineMultiplier,
+                        pktsBaselineMultiplier,
+                        bytesThreshold,
+                        pktsThreshold,
+                        extremeMultiplier,
+                        extremeBytesThreshold,
+                        bytesAnomaly,
+                        pktsAnomaly,
+                        extremeBytes,
+                        pairLearningMode,
+                        pairLearningCapBytes,
+                        pairLearningCapPkts);
                 AlertRecord alert = AlertRecord.largeTraffic(
-                        logId, vendorCode, remark1, remark2, record, baselineBytes, baselinePkts);
+                        logId, vendorCode, remark1, remark2, record, evidence);
                 AlertWithBytes old = bestAlertByPair.get(pairKey);
                 if (old == null || currentBytes > old.currentBytes) {
                     bestAlertByPair.put(pairKey, new AlertWithBytes(alert, currentBytes));
@@ -101,8 +169,10 @@ public final class LargeTrafficDetector implements Serializable {
             alerts.add(value.alert);
         }
 
-        // Pair EMA learns only from bounded heavy candidates and never learns from a pair
-        // that was anomalous anywhere in this five-minute window.
+        // Normal candidates learn their real value. An anomalous pair is still protected from
+        // contaminating a mature EMA. During bootstrap only, however, an anomalous pair may learn
+        // a value capped at the effective context high-quantile threshold so it can eventually
+        // reach pairMinSamples instead of being permanently stuck on the context fallback.
         List<LargeTrafficAccumulator.Candidate> chronological = new ArrayList<>(candidates);
         chronological.sort(new Comparator<LargeTrafficAccumulator.Candidate>() {
             @Override
@@ -115,23 +185,47 @@ public final class LargeTrafficDetector implements Serializable {
         for (LargeTrafficAccumulator.Candidate candidate : chronological) {
             MetricRecord record = candidate.getRecord();
             long pairHash = ConnectionKey.hash64(record.pairKey());
-            if (anomalousPairHashes.contains(pairHash)) {
+            if (!anomalousPairHashes.contains(pairHash)) {
+                pairSamples.add(new HistoricalBaselineStore.PairSample(
+                        pairHash, record.totalBytes(), record.totalPkts(), record.getCollectTimestamp()));
+                continue;
+            }
+
+            BootstrapLearningCap cap = bootstrapLearningCaps.get(pairHash);
+            if (cap == null) {
+                // Mature anomalous pairs, or bootstrap learning disabled: preserve the old behavior.
                 continue;
             }
             pairSamples.add(new HistoricalBaselineStore.PairSample(
-                    pairHash, record.totalBytes(), record.totalPkts(), record.getCollectTimestamp()));
+                    pairHash,
+                    Math.min(record.totalBytes(), cap.bytes),
+                    Math.min(record.totalPkts(), cap.pkts),
+                    record.getCollectTimestamp()));
         }
 
         return new DetectionResult(alerts, pairSamples);
     }
 
-    private ContextStats effectiveContext(LargeTrafficAccumulator acc, String contextKey) {
+    private ContextSelection effectiveContext(LargeTrafficAccumulator acc, String contextKey) {
         ContextStats historical = acc.historicalStats(contextKey);
         if (historical.isUsable()) {
-            return historical;
+            return new ContextSelection(historical, true, historical.getContributingDays());
         }
         // Cold start: use this window's own distribution until enough historical dates exist.
-        return acc.currentStats(contextKey, bytesQuantile, pktsQuantile);
+        return new ContextSelection(
+                acc.currentStats(contextKey, bytesQuantile, pktsQuantile),
+                false,
+                historical.getContributingDays());
+    }
+
+    private static long learningCap(long contextThreshold, long baseline, long current) {
+        if (contextThreshold > 0L) {
+            return contextThreshold;
+        }
+        if (baseline > 0L) {
+            return baseline;
+        }
+        return Math.max(0L, current);
     }
 
     private static long positiveRound(double value, long fallback) {
@@ -139,6 +233,28 @@ public final class LargeTrafficDetector implements Serializable {
             return fallback;
         }
         return value >= Long.MAX_VALUE ? Long.MAX_VALUE : Math.round(value);
+    }
+
+    private static final class ContextSelection {
+        private final ContextStats stats;
+        private final boolean historicalUsable;
+        private final int historicalDays;
+
+        private ContextSelection(ContextStats stats, boolean historicalUsable, int historicalDays) {
+            this.stats = stats;
+            this.historicalUsable = historicalUsable;
+            this.historicalDays = historicalDays;
+        }
+    }
+
+    private static final class BootstrapLearningCap {
+        private final long bytes;
+        private final long pkts;
+
+        private BootstrapLearningCap(long bytes, long pkts) {
+            this.bytes = bytes;
+            this.pkts = pkts;
+        }
     }
 
     private static final class AlertWithBytes {
