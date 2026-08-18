@@ -18,12 +18,27 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** Entry point for the long-running five-minute Doris anomaly detector. */
+/**
+ * 【导读：程序总入口】
+ *
+ * 这个类可以理解成整个 Flink 作业的“main 方法 + 流水线装配图”。
+ * 它本身不负责异常算法，主要做 5 件事：
+ * 1. 读取 application.properties；
+ * 2. 创建 Flink StreamExecutionEnvironment；
+ * 3. 配置重启和 Checkpoint；
+ * 4. 把 DorisPollingAlertSource 接到 JSON 转换，再接日志/Kafka Sink；
+ * 5. 调用 env.execute() 真正提交并启动作业。
+ *
+ * 建议初学者先读这个类，建立“Source -> Map -> Sink”的整体印象，
+ * 再进入 DorisPollingAlertSource 看数据是如何一批一批被读出来的。
+ */
 public class NetTrafficSentinel {
     private static final Logger LOG = LoggerFactory.getLogger(NetTrafficSentinel.class);
 
     public static void main(String[] args) throws Exception {
+        // 第一步：加载配置。支持 --config=xxx.properties，也支持项目根目录 application.properties。
         AppConfig config = AppConfig.load(args);
+        // 在真正启动 Flink 之前先做参数合法性校验，尽早发现错误配置。
         validateConfig(config);
 
         LOG.info("Starting NetTrafficSentinel: jobName={}, table={}, window={}m, timezone={}, logSink={}, kafkaSink={}",
@@ -34,6 +49,7 @@ public class NetTrafficSentinel {
                 config.getBoolean("alert.output.log.enabled", true),
                 config.getBoolean("alert.output.kafka.enabled", false));
 
+        // Flink 的执行环境。可以把它理解成“搭建整条 DataStream 流水线的工作台”。
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
         env.setRestartStrategy(RestartStrategies.fixedDelayRestart(
@@ -41,11 +57,14 @@ public class NetTrafficSentinel {
                 Time.seconds(config.getLong("restart.delay.seconds", 10L))));
         configureCheckpointing(env, config);
 
+        // Source：持续轮询 Doris。注意：本项目不是直接使用 Flink SQL Window，
+        // 而是在 Source 内部手工按 5 分钟范围查询 Doris，并输出已经判定好的 AlertRecord。
         DataStreamSource<AlertRecord> alerts = env.addSource(new DorisPollingAlertSource(config));
         alerts.name("doris-five-minute-polling-source");
         alerts.uid("doris-five-minute-polling-source-v2");
         alerts.setParallelism(config.getInt("source.parallelism", 1));
 
+        // Map：把 Java 告警对象序列化成 JSON 字符串，方便写日志或 Kafka。
         SingleOutputStreamOperator<String> jsonAlerts = alerts
                 .map(new AlertJsonMapper())
                 .name("alert-to-json")
@@ -63,9 +82,16 @@ public class NetTrafficSentinel {
             jsonAlerts.addSink(new NoOpStringSink()).name("alert-noop").uid("alert-noop-v2");
         }
 
+        // execute() 之前，上面的代码只是在“描述”作业拓扑；调用 execute() 后才真正提交执行。
         env.execute(config.get("job.name", "NET-TRAFFIC-ANOMALY"));
     }
 
+    /**
+     * 配置 Flink Checkpoint。
+     *
+     * 可以先记住：Checkpoint 就是 Flink 定期给“游标 + 历史基线”拍快照。
+     * 任务失败重启后，initializeState() 会从最近一次成功快照恢复，避免从头学习基线。
+     */
     private static void configureCheckpointing(StreamExecutionEnvironment env, AppConfig config) {
         boolean checkpointEnabled = config.getBoolean("checkpoint.enabled", true);
         String delivery = config.get("kafka.delivery.guarantee", "at_least_once");

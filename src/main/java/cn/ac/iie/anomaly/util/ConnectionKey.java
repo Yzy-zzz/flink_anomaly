@@ -1,5 +1,9 @@
 package cn.ac.iie.anomaly.util;
 
+/**
+ * IP Pair 辅助工具：把 srcIp/dstIp/protocol 编码成稳定 key，并提供 64 位 hash。
+ * Pair EMA 历史只保存 hash，不保存长字符串，以降低 20 万 Pair 状态的内存开销。
+ */
 public final class ConnectionKey {
     private ConnectionKey() {
     }

@@ -9,6 +9,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.Date;
 
+/** 时间解析和“是否属于非工作时段”的辅助函数。 */
 public final class TimeUtils {
     private static final DateTimeFormatter OUTPUT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter[] INPUTS = new DateTimeFormatter[] {

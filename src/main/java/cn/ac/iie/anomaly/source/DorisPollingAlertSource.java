@@ -33,6 +33,15 @@ import java.util.List;
 import java.util.regex.Pattern;
 
 /**
+ * 【导读：本项目最重要的“调度器”】
+ *
+ * 这是一个 Flink Source，同时也是整个项目的 5 分钟窗口推进器、Doris JDBC 读取器、
+ * Checkpoint 状态持有者。理解它之后，基本就理解了项目为什么能“常驻运行”。
+ *
+ * 它每次只处理一个 [start, end) 的 5 分钟窗口：先查询 Doris 数据进度，确认窗口已经成熟，
+ * 再读取该窗口全部记录交给 FiveMinuteWindowAnalyzer，最后在 Checkpoint 锁内一次性完成：
+ * 输出告警 -> 更新历史基线 -> 推进游标。
+ *
  * Long-running source that polls Doris one mature five-minute data window at a time.
  *
  * Data progress is NOT driven by wall clock. The source periodically queries MAX(collectTime),
@@ -66,8 +75,12 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
     private final AppConfig config;
 
     private volatile boolean running = true;
+    // “处理到哪里了”的业务游标。例如值为 00:10，下一次就处理 [00:10, 00:15)。
+    // 这个变量会进入 Flink Operator State，因此故障恢复后可以接着跑。
     private volatile LocalDateTime nextWindowStart;
 
+    // 下面三个 ListState 是 Flink Checkpoint 真正保存的状态：
+    // 1) 窗口游标；2) Pair EMA；3) Context t-digest 历史桶。
     private transient ListState<String> cursorState;
     private transient ListState<HistoricalBaselineStore.PairSnapshot> pairHistoryState;
     private transient ListState<HistoricalBaselineStore.ContextSnapshot> contextHistoryState;
@@ -111,6 +124,10 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
     }
 
     @Override
+    /**
+     * Source 主循环。初学者建议按下面顺序读 while(running)：
+     * 刷新 Doris 数据水位 -> 判断下一个窗口是否安全 -> 查询并分析 -> 原子提交结果 -> 推进游标。
+     */
     public void run(SourceContext<AlertRecord> ctx) throws Exception {
         if (getRuntimeContext().getNumberOfParallelSubtasks() != 1) {
             throw new IllegalStateException(
@@ -139,6 +156,7 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
 
         while (running) {
             try {
+                // ① 先看 Doris 实际已经有数据到什么时间，不直接相信机器当前时间。
                 refreshDataWatermarkIfNeeded(watermarkPollMillis);
 
                 if (cachedSafeWindowEnd == null) {
@@ -153,12 +171,14 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
                             formatNullable(cachedDorisMaxCollectTime), formatNullable(cachedSafeWindowEnd));
                 }
 
+                // ② 只有“窗口结束时间 <= 安全水位”的窗口才允许处理。
                 LocalDateTime nextWindowEnd = nextWindowStart.plusMinutes(windowMinutes);
                 if (nextWindowEnd.isAfter(cachedSafeWindowEnd)) {
                     sleepInterruptibly(idlePollMillis);
                     continue;
                 }
 
+                // ③ 查询一个完整的 5 分钟窗口。查询过程中只在内存里计算，不立刻改长期历史状态。
                 WindowRange window = WindowRange.fromStart(nextWindowStart, windowMinutes, zoneId);
                 WindowQueryResult result = queryAndAnalyze(window);
 
@@ -175,6 +195,8 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
                     continue;
                 }
 
+                // ④ 告警输出、历史基线更新、游标推进必须作为一个逻辑整体。
+                // 使用 Flink checkpointLock 的目的：避免“Checkpoint 拍到一半状态”的不一致。
                 // Alerts + history update + cursor advance are one logical source action.
                 synchronized (ctx.getCheckpointLock()) {
                     synchronized (stateMutex) {
@@ -222,6 +244,13 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
         throw new IllegalArgumentException("Unsupported source.start.mode: " + mode);
     }
 
+    /**
+     * 计算“安全数据水位”。公式：
+     * safeWindowEnd = floorTo5Min(MAX(collectTime) - stableDelay)
+     *
+     * 例如 Doris MAX=12:37，stableDelay=60 分钟，则安全水位是 11:35。
+     * 这能规避 Doris 数据晚到：即使系统时间已经 20:00，也不会贸然处理 19:55 的窗口。
+     */
     private void refreshDataWatermarkIfNeeded(long pollMillis) throws SQLException {
         long now = System.currentTimeMillis();
         if (cachedSafeWindowEnd != null && now < nextWatermarkRefreshAt) {
@@ -285,6 +314,10 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
         }
     }
 
+    /**
+     * 查询一个 5 分钟 Doris 窗口，并逐行喂给分析器。
+     * JDBC 使用 forward-only 流式读取，避免一次性把数百万/数千万行全部装进 JVM 内存。
+     */
     private WindowQueryResult queryAndAnalyze(WindowRange window) throws SQLException {
         String table = validatedTable();
         String sql = "SELECT " + SELECT_FIELDS + " FROM " + table + " WHERE " + window.toDorisFilter();
@@ -324,6 +357,8 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
                                     nonNegative(rs.getLong(7)),
                                     nonNegative(rs.getLong(8)),
                                     nonNegative(rs.getLong(9)));
+                            // 每读到一行就立即累计到算法结构（t-digest / Top-K heap / Space-Saving），
+                            // 不保存整个 5 分钟窗口的原始数据。
                             analyzer.add(record, parsedTime.getLocalDateTime());
                             rows++;
                             if (progressEvery > 0L && rows % progressEvery == 0L) {
@@ -406,6 +441,9 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
     }
 
     @Override
+    /**
+     * Flink 做 Checkpoint 时调用：把当前游标、Pair EMA、Context 历史全部拷贝进 Operator State。
+     */
     public void snapshotState(FunctionSnapshotContext context) throws Exception {
         synchronized (stateMutex) {
             cursorState.clear();
@@ -426,6 +464,10 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
     }
 
     @Override
+    /**
+     * 作业初始化/故障恢复时调用。若 context.isRestored() 为 true，就把最近一次 Checkpoint
+     * 里的游标和历史基线重新装入内存。
+     */
     public void initializeState(FunctionInitializationContext context) throws Exception {
         this.stateMutex = new Object();
         this.historyStore = new HistoricalBaselineStore(config);

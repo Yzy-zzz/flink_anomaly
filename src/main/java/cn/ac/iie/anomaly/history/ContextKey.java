@@ -3,7 +3,12 @@ package cn.ac.iie.anomaly.history;
 import java.time.DayOfWeek;
 import java.time.LocalDateTime;
 
-/** Compact context key used for historical distribution baselines. */
+/**
+ * 【导读：什么叫 Context】
+ * Context = protocol + WORKDAY/WEEKEND + 时间槽。
+ * 例如 2026-08-13 00:02、protocol=UNKNOWN、slotMinutes=5，会归到：UNKNOWN + WORKDAY + slot0。
+ * 注意这里不含 IP，因此同一 Context 的不同 src/dst 会共享 P50/P99.9。
+ */
 public final class ContextKey {
     private static final char SEP = '\u001f';
 

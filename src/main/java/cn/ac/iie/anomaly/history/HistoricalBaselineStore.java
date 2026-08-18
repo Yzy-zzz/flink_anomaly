@@ -17,6 +17,15 @@ import java.util.NavigableMap;
 import java.util.TreeMap;
 
 /**
+ * 【导读：type=2 的“长期记忆”】
+ *
+ * 这个类不是数据库，而是 TaskManager JVM 里的内存状态；Flink Checkpoint 会把它序列化保存。
+ * 它同时维护两种不同粒度的历史：
+ * - Context History：很多 IP 对共享的分布画像，使用按天 t-digest 桶；
+ * - Pair History：某个 srcIp+dstIp+protocol 自己的 EMA。
+ *
+ * 只有一个 5 分钟窗口完整分析成功后，Source 才调用 apply() 更新这里，所以失败窗口不会留下半截历史。
+ *
  * Long-lived historical state used by anomalyType=2.
  *
  * Context history:
@@ -57,6 +66,10 @@ public final class HistoricalBaselineStore {
         return pairMinSamples;
     }
 
+    /**
+     * 合并最近若干“历史日期桶”的 t-digest，得到一个 Context 的 P50/P90/高分位。
+     * currentDate 当天不参与，避免当前待检测窗口反过来影响自己的历史基线。
+     */
     public ContextStats contextStats(String contextKey, LocalDate currentDate,
                                      double bytesQuantile, double pktsQuantile) {
         if (!contextEnabled) {
@@ -94,6 +107,7 @@ public final class HistoricalBaselineStore {
                 q(bytes, bytesQuantile), q(pkts, pktsQuantile));
     }
 
+    /** 查询 Pair EMA；如果超过事件时间 TTL 没再学习，则视为不存在。 */
     public PairStats pairStats(long pairHash, long referenceEventMillis) {
         if (!pairEnabled) {
             return null;
@@ -131,10 +145,13 @@ public final class HistoricalBaselineStore {
         }
 
         if (pairEnabled) for (PairSample sample : update.pairSamples) {
+            // remove + put 是为了把“刚更新的 Pair”移动到 LinkedHashMap 尾部；
+            // 超过 max.entries 时优先淘汰最久没有被更新的 Pair。
             PairHistory history = pairs.remove(sample.pairHash);
             if (history == null) {
                 history = new PairHistory(sample.bytes, sample.pkts, 1L, sample.eventTimeMillis);
             } else {
+                // EMA = old*(1-alpha) + current*alpha。默认 alpha=0.1，意味着历史占 90%，新样本占 10%。
                 history.emaBytes = ema(history.emaBytes, sample.bytes, pairEmaAlpha);
                 history.emaPkts = ema(history.emaPkts, sample.pkts, pairEmaAlpha);
                 history.sampleCount++;
@@ -145,6 +162,7 @@ public final class HistoricalBaselineStore {
         }
     }
 
+    /** 把内存里的 Pair EMA 转成可被 Flink Operator State 保存的轻量 POJO。 */
     public List<PairSnapshot> snapshotPairs() {
         List<PairSnapshot> snapshots = new ArrayList<>(pairs.size());
         for (Map.Entry<Long, PairHistory> e : pairs.entrySet()) {
@@ -154,6 +172,7 @@ public final class HistoricalBaselineStore {
         return snapshots;
     }
 
+    /** 把 Context t-digest 序列化为 byte[]，供 Flink Checkpoint 保存。 */
     public List<ContextSnapshot> snapshotContexts() {
         List<ContextSnapshot> snapshots = new ArrayList<>();
         for (Map.Entry<String, NavigableMap<Long, ContextBucket>> outer : contextBuckets.entrySet()) {

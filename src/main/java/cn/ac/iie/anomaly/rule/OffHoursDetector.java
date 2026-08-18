@@ -9,7 +9,10 @@ import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Finalizes a bounded Space-Saving sketch into type=3 Top-N alerts. */
+/**
+ * anomalyType=3 的最终输出器：把 Space-Saving sketch 中估算连接数最大的 Pair 排成 Top-N 告警。
+ * 初学者如果只关心 type=2，可以先跳过这个类。
+ */
 public final class OffHoursDetector implements Serializable {
     private static final long serialVersionUID = 1L;
 

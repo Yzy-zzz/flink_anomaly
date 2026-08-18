@@ -17,7 +17,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** Large-traffic detection using historical context sketches + bounded pair EMA history. */
+/**
+ * 【导读：anomalyType=2 的核心判定公式都在这里】
+ *
+ * 可以把 detect() 看成 4 步：
+ * 1) 选择基线：成熟 Pair 用 Pair EMA，否则用 Context P50；
+ * 2) 计算真正阈值：max(Context 高分位, baseline * multiplier)；
+ * 3) 按 bytes + (pkts 或 extremeBytes) 的组合规则判异常；
+ * 4) 决定当前 Pair 是否以及如何写回 EMA。
+ *
+ * 本版本特别加入 CAPPED_BOOTSTRAP：冷启动 Pair 即使第一次就异常，也允许学习“被 Context 高分位封顶后的值”，
+ * 解决异常 Pair 永远 sampleCount=0、永远退回 Context baseline 的学习饿死问题。
+ */
 public final class LargeTrafficDetector implements Serializable {
     private static final long serialVersionUID = 1L;
 
@@ -56,6 +67,7 @@ public final class LargeTrafficDetector implements Serializable {
         this.remark2 = config.get("alert.remark2", "");
     }
 
+    /** 对当前 5 分钟窗口保留下来的大流量候选做最终 type=2 判断。 */
     public DetectionResult detect(LargeTrafficAccumulator acc, HistoricalBaselineStore historyStore) {
         List<LargeTrafficAccumulator.Candidate> candidates = acc.candidateSnapshot();
         if (candidates.isEmpty()) {
@@ -78,13 +90,16 @@ public final class LargeTrafficDetector implements Serializable {
 
             String pairKey = record.pairKey();
             long pairHash = ConnectionKey.hash64(pairKey);
+            // Pair = srcIp + dstIp + protocol。历史里只保存 64 位 hash，减少内存。
             HistoricalBaselineStore.PairStats pair = historyStore.pairStats(pairHash, record.getCollectTimestamp());
             long pairSampleCount = pair == null ? 0L : pair.getSampleCount();
+            // 默认至少学习 3 个样本后，才认为 Pair 自己的 EMA 足够可信。
             boolean pairMature = pair != null && pairSampleCount >= pairMinSamples;
 
             long baselineBytes;
             long baselinePkts;
             String baselineSource;
+            // 基线选择优先级：Pair EMA > 历史 Context P50 > 当前窗口 Context P50。
             if (pairMature) {
                 baselineBytes = positiveRound(pair.getEmaBytes(), context.getP50Bytes());
                 baselinePkts = positiveRound(pair.getEmaPkts(), context.getP50Pkts());
@@ -98,16 +113,20 @@ public final class LargeTrafficDetector implements Serializable {
 
             long currentBytes = record.totalBytes();
             long currentPkts = record.totalPkts();
+            // 真正的 bytes 报警阈值不是 baseline*4 这么简单，而是二者取大：
+            // max(Context P99.9, baselineBytes * 4)。这样可避免 baseline 很小时阈值低得离谱。
             double bytesThreshold = Math.max((double) context.getThresholdBytes(),
                     baselineBytes * bytesBaselineMultiplier);
             double pktsThreshold = Math.max((double) context.getThresholdPkts(),
                     baselinePkts * pktsBaselineMultiplier);
             double extremeBytesThreshold = ((double) context.getThresholdBytes()) * extremeMultiplier;
 
+            // 三个布尔量就是告警证据中 bytes_anomaly / pkts_anomaly / extreme_bytes 的来源。
             boolean bytesAnomaly = currentBytes > bytesThreshold;
             boolean pktsAnomaly = currentPkts > pktsThreshold;
             boolean extremeBytes = currentBytes > extremeBytesThreshold;
 
+            // 最终 type=2 条件：bytes 必须异常，并且 pkts 也异常，或者 bytes 已经极端异常。
             if (bytesAnomaly && (pktsAnomaly || extremeBytes)) {
                 anomalousPairHashes.add(pairHash);
 
@@ -115,6 +134,8 @@ public final class LargeTrafficDetector implements Serializable {
                 Long pairLearningCapBytes = null;
                 Long pairLearningCapPkts = null;
                 if (!pairMature && bootstrapAnomalyCappedLearningEnabled) {
+                    // 冷启动修复：允许异常 Pair 学习，但学习值不得超过 Context 高分位阈值。
+                    // 例：当前 5MB、Context P99.9=1MB，则 EMA 只学习 1MB，不直接学习 5MB。
                     long capBytes = learningCap(context.getThresholdBytes(), baselineBytes, currentBytes);
                     long capPkts = learningCap(context.getThresholdPkts(), baselinePkts, currentPkts);
                     bootstrapLearningCaps.put(pairHash, new BootstrapLearningCap(capBytes, capPkts));
@@ -122,11 +143,13 @@ public final class LargeTrafficDetector implements Serializable {
                     pairLearningCapBytes = capBytes;
                     pairLearningCapPkts = capPkts;
                 } else if (pairMature) {
+                    // Pair 已经成熟后，异常样本继续完全跳过，避免攻击把稳定 EMA 越抬越高。
                     pairLearningMode = LEARNING_SKIP_ANOMALOUS_MATURE;
                 } else {
                     pairLearningMode = LEARNING_SKIP_ANOMALOUS;
                 }
 
+                // 把“为什么报警”所需的全部中间值封装起来，AlertRecord 会原样写入 anomalyDetail。
                 AlertRecord.LargeTrafficEvidence evidence = new AlertRecord.LargeTrafficEvidence(
                         baselineSource,
                         baselineBytes,
@@ -206,6 +229,9 @@ public final class LargeTrafficDetector implements Serializable {
         return new DetectionResult(alerts, pairSamples);
     }
 
+    /**
+     * Context 冷启动选择：历史达到 min.days 就用历史；否则临时使用当前窗口分布。
+     */
     private ContextSelection effectiveContext(LargeTrafficAccumulator acc, String contextKey) {
         ContextStats historical = acc.historicalStats(contextKey);
         if (historical.isUsable()) {

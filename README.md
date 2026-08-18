@@ -11,6 +11,18 @@
 
 ---
 
+## 学习版文档
+
+如果你不熟悉 Flink 或想从头理解 type=2 算法，优先阅读：
+
+- `docs/NetTrafficSentinel代码与算法完全指南.docx`：完整 Word 手册；
+- `docs/BEGINNER_CODE_AND_ALGORITHM_GUIDE_CN.md`：同内容 Markdown 版；
+- `src/main/java`：关键主链路源码已经补充“导读”和算法中文注释。
+
+建议阅读顺序：`NetTrafficSentinel -> DorisPollingAlertSource -> FiveMinuteWindowAnalyzer -> LargeTrafficAccumulator -> LargeTrafficDetector -> HistoricalBaselineStore -> AlertRecord`。
+
+---
+
 ## 1. 本版本解决了什么问题
 
 上一版存在两个现实问题：

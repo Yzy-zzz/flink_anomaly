@@ -2,6 +2,10 @@ package cn.ac.iie.anomaly.model;
 
 import java.io.Serializable;
 
+/**
+ * Doris 一行网络指标在 Java 里的数据对象。
+ * type=2 主要使用 totalBytes() 和 totalPkts()；Pair key 使用 srcIp + dstIp + protocol。
+ */
 public class MetricRecord implements Serializable {
     private static final long serialVersionUID = 1L;
 
@@ -33,6 +37,7 @@ public class MetricRecord implements Serializable {
         this.s2cBytes = s2cBytes;
     }
 
+    /** 总字节数 = 客户端到服务端 + 服务端到客户端。 */
     public long totalBytes() {
         return safeAdd(c2sBytes, s2cBytes);
     }

@@ -6,7 +6,10 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 
-/** A half-open business-time window: [start, end). */
+/**
+ * 业务 5 分钟窗口，采用左闭右开 [start, end)。
+ * 例如 [00:00, 00:05) 包含 00:04:59，但不包含 00:05:00，避免相邻窗口重复统计。
+ */
 public final class WindowRange implements Serializable {
     private static final long serialVersionUID = 1L;
     public static final DateTimeFormatter DATETIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");

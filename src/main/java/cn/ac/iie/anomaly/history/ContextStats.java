@@ -2,7 +2,11 @@ package cn.ac.iie.anomaly.history;
 
 import java.io.Serializable;
 
-/** Historical or current-window quantile summary for one context. */
+/**
+ * 一个 Context 的分位数摘要。
+ * p50 是中位数；p90 是 90 分位；thresholdBytes/thresholdPkts 通常是配置的高分位（默认 P99.9）。
+ * usable 表示历史天数是否达到 history.context.min.days，可否当成正式历史基线使用。
+ */
 public final class ContextStats implements Serializable {
     private static final long serialVersionUID = 1L;
 

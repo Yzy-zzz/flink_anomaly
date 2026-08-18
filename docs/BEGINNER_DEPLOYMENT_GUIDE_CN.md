@@ -1,4 +1,4 @@
-# NetTrafficSentinel 小白部署与代码说明（历史基线 + Doris 延迟入库版）
+# NetTrafficSentinel 部署与代码说明（历史基线 + Doris 延迟入库版）
 
 本文假设你以前没有维护过 Flink 长任务，也尽量按“照着做即可”的方式解释。
 

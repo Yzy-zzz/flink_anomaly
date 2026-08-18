@@ -7,6 +7,11 @@ import java.io.InputStream;
 import java.io.Serializable;
 import java.util.Properties;
 
+/**
+ * application.properties 的轻量读取器。
+ * 优先级：--config 指定文件 > 当前目录 application.properties > classpath 内置配置；
+ * 同名 JVM -D 系统属性还可以覆盖最终值。
+ */
 public final class AppConfig implements Serializable {
     private static final long serialVersionUID = 1L;
     private final Properties properties;

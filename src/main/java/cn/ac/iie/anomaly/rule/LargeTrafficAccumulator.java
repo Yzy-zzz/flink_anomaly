@@ -15,6 +15,14 @@ import java.util.Map;
 import java.util.PriorityQueue;
 
 /**
+ * 【导读：type=2 的“省内存累计器”】
+ *
+ * 5 分钟窗口可能有海量记录，本类绝不保存全量明细，只保存两类摘要：
+ * 1) 每个 Context 的 t-digest，用于近似计算 P50/P90/P99.9 等分位数；
+ * 2) 固定容量的最小堆，只留下 totalBytes 最大的候选记录。
+ *
+ * 因此 candidate.capacity=20000 的含义不是“最多读 2 万行”，而是“读全量，但只保留最大的 2 万条候选”。
+ *
  * Bounded accumulator for one five-minute query.
  * It keeps per-context quantile sketches plus a fixed-size heap of the largest records.
  * No full IP-pair hash table is retained.
@@ -24,6 +32,8 @@ public final class LargeTrafficAccumulator implements Serializable {
 
     private final double compression;
     private final int candidateCapacity;
+    // 最小堆：堆顶永远是当前候选里 bytes 最小的那条。
+    // 新记录比堆顶更大时，淘汰堆顶，从而最终保留窗口内最大的 N 条。
     private final PriorityQueue<Candidate> candidates;
     private final Map<String, ContextAccumulator> contexts = new HashMap<>();
     private final Map<String, ContextStats> historicalStats = new HashMap<>();
@@ -35,6 +45,7 @@ public final class LargeTrafficAccumulator implements Serializable {
         this.candidates = new PriorityQueue<>(candidateCapacity, new CandidateBytesComparator());
     }
 
+    /** 把一条记录加入 Context 分布摘要，并尝试进入“最大流量候选集合”。 */
     public void add(MetricRecord record, String contextKey, ContextStats history) {
         ContextAccumulator context = contexts.get(contextKey);
         if (context == null) {
@@ -66,6 +77,10 @@ public final class LargeTrafficAccumulator implements Serializable {
         return stats == null ? ContextStats.empty() : stats;
     }
 
+    /**
+     * 当历史 Context 还不成熟时，用当前窗口自身的分布临时兜底。
+     * 这就是冷启动阶段 baseline 可能来自 CURRENT_CONTEXT_P50 的来源。
+     */
     public ContextStats currentStats(String contextKey, double bytesQuantile, double pktsQuantile) {
         ContextAccumulator context = contexts.get(contextKey);
         if (context == null || context.count == 0L) {
@@ -132,8 +147,10 @@ public final class LargeTrafficAccumulator implements Serializable {
 
     private static final class ContextAccumulator implements Serializable {
         private static final long serialVersionUID = 1L;
+        // raw*：保留当前窗口原始分布，用于“当前窗口兜底阈值”。
         private final TDigest rawBytes;
         private final TDigest rawPkts;
+        // history*：准备写回长期 Context 历史的分布。极端值会先封顶，防止抬高未来基线。
         private final TDigest historyBytes;
         private final TDigest historyPkts;
         private long count;

@@ -16,7 +16,7 @@
 12. checkpoint 默认周期调整为 5 分钟，并强烈建议使用 HDFS checkpoint storage。
 13. Source/Map/Sink 增加稳定 UID，方便未来 savepoint 状态映射。
 14. 删除旧 CountMinSketch 源码及测试，避免误导。
-15. 更新 README 和小白部署文档。
+15. 更新 README 和部署文档。
 
 
 ## 2026-08-17 type=2 可观测性与 Pair 冷启动修复

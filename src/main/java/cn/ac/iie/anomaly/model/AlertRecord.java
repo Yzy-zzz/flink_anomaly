@@ -4,6 +4,10 @@ import java.io.Serializable;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+/**
+ * 最终告警对象。Jackson 会通过 getter 把它序列化成 JSON。
+ * anomalyDetail 使用 LinkedHashMap，是为了让日志字段顺序稳定、便于人工阅读。
+ */
 public class AlertRecord implements Serializable {
     private static final long serialVersionUID = 1L;
 
@@ -21,6 +25,10 @@ public class AlertRecord implements Serializable {
     public AlertRecord() {
     }
 
+    /**
+     * anomalyType=2 的 JSON 字段组装处。
+     * 如果你想知道日志里的 baseline_source / bytes_threshold 等字段从哪里输出，就看这个方法。
+     */
     public static AlertRecord largeTraffic(String logId, String vendorCode, String remark1, String remark2,
                                            MetricRecord metric, LargeTrafficEvidence evidence) {
         AlertRecord alert = base(logId, vendorCode, remark1, remark2, metric.getCollectTime(),
@@ -102,7 +110,10 @@ public class AlertRecord implements Serializable {
     public String getRemark2() { return remark2; }
     public String getVendorCode() { return vendorCode; }
 
-    /** Complete, typed explanation of one anomalyType=2 decision. */
+    /**
+     * type=2 的“判定证据快照”。Detector 负责计算，AlertRecord 负责把这些值写进 anomalyDetail。
+     * 这样排查误报时不需要重新猜当时使用了哪个 baseline、P99.9 和 multiplier。
+     */
     public static final class LargeTrafficEvidence implements Serializable {
         private static final long serialVersionUID = 1L;
 
