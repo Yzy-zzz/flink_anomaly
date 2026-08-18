@@ -29,7 +29,6 @@ public class FiveMinuteWindowAnalyzerTest {
                 "rule.offhours.sketch.capacity=8\n" +
                 "rule.offhours.weekday.start.hour=20\n" +
                 "rule.offhours.weekday.end.hour=8\n" +
-                "alert.logid=STATIC\n" +
                 "alert.vendorCode=V001\n" +
                 "alert.remark1=\n" +
                 "alert.remark2=\n";

@@ -29,9 +29,9 @@ public class AlertRecord implements Serializable {
      * anomalyType=2 的 JSON 字段组装处。
      * 如果你想知道日志里的 baseline_source / bytes_threshold 等字段从哪里输出，就看这个方法。
      */
-    public static AlertRecord largeTraffic(String logId, String vendorCode, String remark1, String remark2,
+    public static AlertRecord largeTraffic(String vendorCode, String remark1, String remark2,
                                            MetricRecord metric, LargeTrafficEvidence evidence) {
-        AlertRecord alert = base(logId, vendorCode, remark1, remark2, metric.getCollectTime(),
+        AlertRecord alert = base(vendorCode, remark1, remark2, metric.getCollectTime(),
                 metric.getSrcIp(), metric.getDstIp(), metric.getProtocol(), 2);
         alert.anomalyDetail.put("current_bytes", metric.totalBytes());
         alert.anomalyDetail.put("current_pkts", metric.totalPkts());
@@ -72,10 +72,10 @@ public class AlertRecord implements Serializable {
         return alert;
     }
 
-    public static AlertRecord offHours(String logId, String vendorCode, String remark1, String remark2,
+    public static AlertRecord offHours(String vendorCode, String remark1, String remark2,
                                        String collectTime, String srcIp, String dstIp, String protocol,
                                        int rank, int topN, long conns) {
-        AlertRecord alert = base(logId, vendorCode, remark1, remark2, collectTime,
+        AlertRecord alert = base(vendorCode, remark1, remark2, collectTime,
                 srcIp, dstIp, protocol, 3);
         alert.anomalyDetail.put("topRank", rank);
         alert.anomalyDetail.put("TopN", topN);
@@ -83,11 +83,10 @@ public class AlertRecord implements Serializable {
         return alert;
     }
 
-    private static AlertRecord base(String logId, String vendorCode, String remark1, String remark2,
+    private static AlertRecord base(String vendorCode, String remark1, String remark2,
                                     String collectTime, String srcIp, String dstIp, String protocol,
                                     int anomalyType) {
         AlertRecord alert = new AlertRecord();
-        alert.logId = logId;
         alert.vendorCode = vendorCode;
         alert.remark1 = remark1;
         alert.remark2 = remark2;
@@ -97,6 +96,20 @@ public class AlertRecord implements Serializable {
         alert.protocol = protocol;
         alert.anomalyType = anomalyType;
         return alert;
+    }
+
+    /**
+     * logId 不在规则 Detector 中生成，而是在 Source 真正输出前统一分配。
+     * 这样 ID 序号与 Flink 的“输出 + 游标推进 + Checkpoint 状态”处于同一提交路径。
+     */
+    public void assignLogId(String logId) {
+        if (logId == null || logId.trim().isEmpty()) {
+            throw new IllegalArgumentException("logId must not be blank");
+        }
+        if (this.logId != null && !this.logId.equals(logId)) {
+            throw new IllegalStateException("logId has already been assigned: " + this.logId);
+        }
+        this.logId = logId;
     }
 
     public String getLogId() { return logId; }

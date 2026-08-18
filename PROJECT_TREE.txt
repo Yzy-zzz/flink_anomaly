@@ -48,6 +48,7 @@ NetTrafficSentinel-beginner-commented/
                   DorisPollingAlertSource.java
                 util/
                   ConnectionKey.java
+                  AlertLogIdGenerator.java
                   TimeUtils.java
               topology/
                 NetTrafficSentinel.java
@@ -70,4 +71,5 @@ NetTrafficSentinel-beginner-commented/
                   CountMinSketchTest.java
                   WeightedSpaceSavingSketchTest.java
                 util/
+                  AlertLogIdGeneratorTest.java
                   TimeUtilsTest.java

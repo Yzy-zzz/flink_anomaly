@@ -70,7 +70,7 @@ public class NetTrafficSentinel {
                 .name("alert-to-json")
                 .uid("alert-to-json-v2");
 
-        boolean logEnabled = config.getBoolean("alert.output.log.enabled", true);
+        boolean logEnabled = config.getBoolean("alert.output.log.enabled", false);
         boolean kafkaEnabled = config.getBoolean("alert.output.kafka.enabled", false);
         if (logEnabled) {
             jsonAlerts.addSink(new LocalLogSink()).name("alert-local-log").uid("alert-local-log-v2");
@@ -130,6 +130,10 @@ public class NetTrafficSentinel {
         }
         if (config.getInt("source.parallelism", 1) != 1) {
             throw new IllegalArgumentException("This version requires source.parallelism=1");
+        }
+        String deviceId = config.get("alert.device.id");
+        if (!deviceId.matches("\\d{6}")) {
+            throw new IllegalArgumentException("alert.device.id must be exactly 6 digits");
         }
         if (config.get("doris.password").startsWith("CHANGE_ME_")) {
             throw new IllegalArgumentException("Use an external application.properties with the Doris password");

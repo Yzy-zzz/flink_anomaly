@@ -7,6 +7,7 @@ import cn.ac.iie.anomaly.model.AlertRecord;
 import cn.ac.iie.anomaly.model.MetricRecord;
 import cn.ac.iie.anomaly.rule.FiveMinuteWindowAnalyzer;
 import cn.ac.iie.anomaly.rule.WindowAnalysisResult;
+import cn.ac.iie.anomaly.util.AlertLogIdGenerator;
 import cn.ac.iie.anomaly.util.TimeUtils;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
@@ -58,7 +59,7 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
         implements CheckpointedFunction {
 
     private static final Logger LOG = LoggerFactory.getLogger(DorisPollingAlertSource.class);
-    private static final long serialVersionUID = 2L;
+    private static final long serialVersionUID = 3L;
     private static final Pattern SAFE_TABLE = Pattern.compile("[A-Za-z0-9_.$]+(?:\\.[A-Za-z0-9_.$]+)?");
 
     private static final String SELECT_FIELDS = String.join(",",
@@ -79,14 +80,17 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
     // 这个变量会进入 Flink Operator State，因此故障恢复后可以接着跑。
     private volatile LocalDateTime nextWindowStart;
 
-    // 下面三个 ListState 是 Flink Checkpoint 真正保存的状态：
-    // 1) 窗口游标；2) Pair EMA；3) Context t-digest 历史桶。
+    // 下面四个 ListState 是 Flink Checkpoint 真正保存的状态：
+    // 1) 窗口游标；2) Pair EMA；3) Context t-digest 历史桶；4) 告警 logId 的“日期 + 下一序号”。
     private transient ListState<String> cursorState;
     private transient ListState<HistoricalBaselineStore.PairSnapshot> pairHistoryState;
     private transient ListState<HistoricalBaselineStore.ContextSnapshot> contextHistoryState;
+    private transient ListState<String> alertLogIdState;
     private transient HistoricalBaselineStore historyStore;
     private transient Object stateMutex;
     private transient ZoneId zoneId;
+    private transient AlertLogIdGenerator alertLogIdGenerator;
+    private transient String restoredAlertLogIdState;
     private transient Connection currentConnection;
     private transient Statement currentStatement;
 
@@ -112,6 +116,10 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
         this.zoneId = ZoneId.of(config.get("business.timezone", "Asia/Shanghai"));
         this.stateMutex = this.stateMutex == null ? new Object() : this.stateMutex;
         this.historyStore = this.historyStore == null ? new HistoricalBaselineStore(config) : this.historyStore;
+        this.alertLogIdGenerator = new AlertLogIdGenerator(config.get("alert.device.id"), zoneId);
+        if (restoredAlertLogIdState != null) {
+            this.alertLogIdGenerator.restoreState(restoredAlertLogIdState);
+        }
         Class.forName("com.mysql.cj.jdbc.Driver");
 
         processedWindows = getRuntimeContext().getMetricGroup().counter("processedWindows");
@@ -153,6 +161,9 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
         }
         LOG.info("Restored historical state: pairEntries={}, contextBuckets={}",
                 historyStore.pairSize(), historyStore.contextBucketSize());
+        LOG.info("Alert logId generator: deviceId={}, restoredDate={}, restoredNextSequence={}",
+                alertLogIdGenerator.getDeviceId(), alertLogIdGenerator.getSequenceDate(),
+                alertLogIdGenerator.getNextSequence());
 
         while (running) {
             try {
@@ -201,6 +212,9 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
                 synchronized (ctx.getCheckpointLock()) {
                     synchronized (stateMutex) {
                         for (AlertRecord alert : result.analysis.getAlerts()) {
+                            // 事件记录本地ID：yyyyMMdd + 6位设备ID + 18位当天自增序号。
+                            // 必须在真正 collect 前分配，并与游标/历史状态一起受 checkpointLock 保护。
+                            alert.assignLogId(alertLogIdGenerator.nextId());
                             ctx.collect(alert);
                             emittedAlerts.inc();
                         }
@@ -442,7 +456,7 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
 
     @Override
     /**
-     * Flink 做 Checkpoint 时调用：把当前游标、Pair EMA、Context 历史全部拷贝进 Operator State。
+     * Flink 做 Checkpoint 时调用：把当前游标、Pair EMA、Context 历史、logId 日内序号全部拷贝进 Operator State。
      */
     public void snapshotState(FunctionSnapshotContext context) throws Exception {
         synchronized (stateMutex) {
@@ -459,6 +473,14 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
             contextHistoryState.clear();
             for (HistoricalBaselineStore.ContextSnapshot snapshot : historyStore.snapshotContexts()) {
                 contextHistoryState.add(snapshot);
+            }
+
+            alertLogIdState.clear();
+            if (alertLogIdGenerator != null) {
+                String generatorState = alertLogIdGenerator.snapshotState();
+                if (!generatorState.isEmpty()) {
+                    alertLogIdState.add(generatorState);
+                }
             }
         }
     }
@@ -478,6 +500,8 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
                 "large-traffic-pair-history-v2", HistoricalBaselineStore.PairSnapshot.class));
         contextHistoryState = context.getOperatorStateStore().getListState(new ListStateDescriptor<>(
                 "large-traffic-context-history-v2", HistoricalBaselineStore.ContextSnapshot.class));
+        alertLogIdState = context.getOperatorStateStore().getListState(new ListStateDescriptor<>(
+                "alert-log-id-sequence-v1", String.class));
 
         if (context.isRestored()) {
             for (String value : cursorState.get()) {
@@ -491,6 +515,12 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
             }
             for (HistoricalBaselineStore.ContextSnapshot snapshot : contextHistoryState.get()) {
                 historyStore.restoreContext(snapshot);
+            }
+            for (String value : alertLogIdState.get()) {
+                if (value != null && !value.trim().isEmpty()) {
+                    restoredAlertLogIdState = value.trim();
+                    break;
+                }
             }
         }
     }

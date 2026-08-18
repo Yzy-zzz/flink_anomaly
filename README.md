@@ -58,6 +58,33 @@ Doris MAX(collectTime)
 
 ---
 
+
+## 告警 logId：事件记录本地 ID
+
+告警 JSON 中的 `logId` 不再使用固定配置值，而是在 Source 真正输出告警时生成：
+
+```text
+yyyyMMdd + 6位设备ID + 18位日内自增序号
+```
+
+总长度固定为 **32 位数字**。例如设备 ID 为 `123456`，2026-08-18 当天前 3 条告警分别是：
+
+```text
+20260818123456000000000000000000
+20260818123456000000000000000001
+20260818123456000000000000000002
+```
+
+配置：
+
+```properties
+alert.device.id=123456
+```
+
+生产环境必须把它改成该设备唯一的 **6 位数字 ID**。序号每天从 `0` 开始，日期使用 `business.timezone` 对应的当前系统日期。`DorisPollingAlertSource` 会把“当前日期 + 下一序号”写入 Flink Operator State，和窗口游标、历史基线一起 Checkpoint。
+
+18 位序号理论容量为 `0 ~ 999999999999999999`；即使每天告警接近百亿，容量也远远足够。
+
 ## 2. 项目信息
 
 - Maven artifact：`NetTrafficSentinel`

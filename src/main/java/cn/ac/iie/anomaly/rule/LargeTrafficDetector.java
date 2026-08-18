@@ -37,7 +37,7 @@ public final class LargeTrafficDetector implements Serializable {
     private static final String BASELINE_CURRENT_CONTEXT = "CURRENT_CONTEXT_P50";
     private static final String CONTEXT_HISTORICAL = "HISTORICAL";
     private static final String CONTEXT_CURRENT_WINDOW = "CURRENT_WINDOW";
-    private static final String LEARNING_NORMAL = "NORMAL";
+    // private static final String LEARNING_NORMAL = "NORMAL";
     private static final String LEARNING_CAPPED_BOOTSTRAP = "CAPPED_BOOTSTRAP";
     private static final String LEARNING_SKIP_ANOMALOUS_MATURE = "SKIP_ANOMALOUS_MATURE";
     private static final String LEARNING_SKIP_ANOMALOUS = "SKIP_ANOMALOUS";
@@ -48,7 +48,6 @@ public final class LargeTrafficDetector implements Serializable {
     private final double pktsBaselineMultiplier;
     private final double extremeMultiplier;
     private final boolean bootstrapAnomalyCappedLearningEnabled;
-    private final String logId;
     private final String vendorCode;
     private final String remark1;
     private final String remark2;
@@ -61,7 +60,6 @@ public final class LargeTrafficDetector implements Serializable {
         this.extremeMultiplier = config.getDouble("rule.large.extreme.multiplier", 2d);
         this.bootstrapAnomalyCappedLearningEnabled = config.getBoolean(
                 "history.pair.bootstrap.anomaly.capped.learning.enabled", true);
-        this.logId = config.get("alert.logid", "STATIC_LOG_ID");
         this.vendorCode = config.get("alert.vendorCode", "V001");
         this.remark1 = config.get("alert.remark1", "");
         this.remark2 = config.get("alert.remark2", "");
@@ -179,7 +177,7 @@ public final class LargeTrafficDetector implements Serializable {
                         pairLearningCapBytes,
                         pairLearningCapPkts);
                 AlertRecord alert = AlertRecord.largeTraffic(
-                        logId, vendorCode, remark1, remark2, record, evidence);
+                        vendorCode, remark1, remark2, record, evidence);
                 AlertWithBytes old = bestAlertByPair.get(pairKey);
                 if (old == null || currentBytes > old.currentBytes) {
                     bestAlertByPair.put(pairKey, new AlertWithBytes(alert, currentBytes));

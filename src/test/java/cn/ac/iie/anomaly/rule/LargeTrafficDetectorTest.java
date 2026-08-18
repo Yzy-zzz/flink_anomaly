@@ -179,7 +179,6 @@ public class LargeTrafficDetectorTest {
                 "history.pair.ema.alpha=0.1\n" +
                 "history.pair.min.samples=3\n" +
                 "history.pair.bootstrap.anomaly.capped.learning.enabled=" + cappedBootstrapLearning + "\n" +
-                "alert.logid=STATIC\n" +
                 "alert.vendorCode=V001\n" +
                 "alert.remark1=\n" +
                 "alert.remark2=\n";
