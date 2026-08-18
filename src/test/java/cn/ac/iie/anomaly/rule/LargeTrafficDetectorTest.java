@@ -3,6 +3,7 @@ package cn.ac.iie.anomaly.rule;
 import cn.ac.iie.anomaly.config.AppConfig;
 import cn.ac.iie.anomaly.config.WindowRange;
 import cn.ac.iie.anomaly.history.ContextKey;
+import cn.ac.iie.anomaly.history.ContextStats;
 import cn.ac.iie.anomaly.history.HistoricalBaselineStore;
 import cn.ac.iie.anomaly.model.AlertRecord;
 import cn.ac.iie.anomaly.model.MetricRecord;
@@ -25,13 +26,15 @@ public class LargeTrafficDetectorTest {
     private static final ZoneId ZONE = ZoneId.of("Asia/Shanghai");
 
     @Test
-    public void type2AlertContainsFullEvidenceAndBootstrapLearnsCappedSample() throws Exception {
+    public void type2AlertContainsCompactDetailAndBootstrapLearnsCappedSample() throws Exception {
         Path file = tempConfig(true);
         try {
             AppConfig config = AppConfig.load(new String[]{"--config", file.toString()});
             HistoricalBaselineStore store = new HistoricalBaselineStore(config);
             LocalDateTime currentTime = LocalDateTime.of(2026, 8, 17, 0, 1);
             String contextKey = seedHistoricalContext(store, currentTime);
+            ContextStats historicalContext = store.contextStats(
+                    contextKey, currentTime.toLocalDate(), 0.999d, 0.999d);
 
             WindowRange window = WindowRange.fromStart(LocalDateTime.of(2026, 8, 17, 0, 0), 5, ZONE);
             FiveMinuteWindowAnalyzer analyzer = new FiveMinuteWindowAnalyzer(config, store, window);
@@ -44,37 +47,70 @@ public class LargeTrafficDetectorTest {
             Assert.assertEquals(2, alert.getAnomalyType());
 
             Map<String, Object> detail = alert.getAnomalyDetail();
-            Assert.assertEquals("HISTORICAL_CONTEXT_P50", detail.get("baseline_source"));
-            Assert.assertEquals("HISTORICAL", detail.get("context_source"));
-            Assert.assertEquals(0L, ((Number) detail.get("pair_sample_count")).longValue());
-            Assert.assertEquals(3, ((Number) detail.get("pair_min_samples")).intValue());
-            Assert.assertEquals("CAPPED_BOOTSTRAP", detail.get("pair_learning_mode"));
-            Assert.assertTrue((Boolean) detail.get("bytes_anomaly"));
-            Assert.assertTrue((Boolean) detail.get("pkts_anomaly"));
-            Assert.assertTrue(detail.containsKey("bytes_threshold"));
-            Assert.assertTrue(detail.containsKey("pkts_threshold"));
-            Assert.assertTrue(detail.containsKey("context_p50_bytes"));
-            Assert.assertTrue(detail.containsKey("context_p90_bytes"));
-            Assert.assertTrue(detail.containsKey("context_high_quantile_bytes"));
-            Assert.assertEquals(0.999d, ((Number) detail.get("context_bytes_quantile")).doubleValue(), 0.0d);
+            Assert.assertEquals("type=2 detail should stay compact", 8, detail.size());
+            Assert.assertEquals(5000L, ((Number) detail.get("current_bytes")).longValue());
+            Assert.assertEquals(50L, ((Number) detail.get("current_pkts")).longValue());
+            Assert.assertEquals(historicalContext.getP50Bytes(),
+                    ((Number) detail.get("baseline_bytes")).longValue());
+            Assert.assertEquals(historicalContext.getP50Pkts(),
+                    ((Number) detail.get("baseline_pkts")).longValue());
+            Assert.assertEquals((double) historicalContext.getThresholdBytes(),
+                    ((Number) detail.get("bytes_threshold")).doubleValue(), 0.001d);
+            Assert.assertEquals((double) historicalContext.getThresholdPkts(),
+                    ((Number) detail.get("pkts_threshold")).doubleValue(), 0.001d);
+            Assert.assertEquals(historicalContext.getThresholdBytes() * 2d,
+                    ((Number) detail.get("extreme_bytes_threshold")).doubleValue(), 0.001d);
+            Assert.assertEquals("BYTES_AND_PKTS", detail.get("anomaly_reason"));
 
-            long learningCapBytes = ((Number) detail.get("pair_learning_cap_bytes")).longValue();
-            long learningCapPkts = ((Number) detail.get("pair_learning_cap_pkts")).longValue();
-            Assert.assertEquals(((Number) detail.get("context_high_quantile_bytes")).longValue(), learningCapBytes);
-            Assert.assertEquals(((Number) detail.get("context_high_quantile_pkts")).longValue(), learningCapPkts);
-            Assert.assertTrue("bootstrap sample must be capped below the anomaly", learningCapBytes < record.totalBytes());
-            Assert.assertTrue("bootstrap packet sample must be capped below the anomaly", learningCapPkts < record.totalPkts());
+            // Internal algorithm/debug fields must not leak into the external alert contract.
+            Assert.assertFalse(detail.containsKey("baseline_source"));
+            Assert.assertFalse(detail.containsKey("context_high_quantile_bytes"));
+            Assert.assertFalse(detail.containsKey("bytes_baseline_multiplier"));
+            Assert.assertFalse(detail.containsKey("pair_learning_mode"));
+            Assert.assertFalse(detail.containsKey("bytes_anomaly"));
 
             store.apply(result.getHistoryUpdate(), window.getEnd(), ZONE);
             long pairHash = ConnectionKey.hash64(record.pairKey());
             HistoricalBaselineStore.PairStats learned = store.pairStats(pairHash, record.getCollectTimestamp());
             Assert.assertNotNull(learned);
             Assert.assertEquals(1L, learned.getSampleCount());
-            Assert.assertEquals((double) learningCapBytes, learned.getEmaBytes(), 0.001d);
-            Assert.assertEquals((double) learningCapPkts, learned.getEmaPkts(), 0.001d);
+            Assert.assertEquals((double) historicalContext.getThresholdBytes(), learned.getEmaBytes(), 0.001d);
+            Assert.assertEquals((double) historicalContext.getThresholdPkts(), learned.getEmaPkts(), 0.001d);
+            Assert.assertTrue("bootstrap sample must be capped below the anomaly",
+                    historicalContext.getThresholdBytes() < record.totalBytes());
+            Assert.assertTrue("bootstrap packet sample must be capped below the anomaly",
+                    historicalContext.getThresholdPkts() < record.totalPkts());
 
             // Keep this assertion so a future ContextKey change cannot silently invalidate the fixture.
             Assert.assertEquals(contextKey, ContextKey.of("UNKNOWN", currentTime, 5));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    public void type2ReasonIsExtremeBytesWhenPacketsStayBelowThreshold() throws Exception {
+        Path file = tempConfig(true);
+        try {
+            AppConfig config = AppConfig.load(new String[]{"--config", file.toString()});
+            HistoricalBaselineStore store = new HistoricalBaselineStore(config);
+            LocalDateTime currentTime = LocalDateTime.of(2026, 8, 17, 0, 1);
+            seedHistoricalContext(store, currentTime);
+
+            WindowRange window = WindowRange.fromStart(LocalDateTime.of(2026, 8, 17, 0, 0), 5, ZONE);
+            FiveMinuteWindowAnalyzer analyzer = new FiveMinuteWindowAnalyzer(config, store, window);
+            // Historical packet threshold is above 5, while bytes is deliberately extreme.
+            analyzer.add(metric(currentTime, "10.0.0.7", "10.0.0.8", 5000L, 5L), currentTime);
+
+            WindowAnalysisResult result = analyzer.finish();
+            Assert.assertEquals(1, result.getAlerts().size());
+            Map<String, Object> detail = result.getAlerts().get(0).getAnomalyDetail();
+            Assert.assertEquals(8, detail.size());
+            Assert.assertEquals("EXTREME_BYTES", detail.get("anomaly_reason"));
+            Assert.assertTrue(((Number) detail.get("current_bytes")).doubleValue()
+                    > ((Number) detail.get("extreme_bytes_threshold")).doubleValue());
+            Assert.assertTrue(((Number) detail.get("current_pkts")).doubleValue()
+                    <= ((Number) detail.get("pkts_threshold")).doubleValue());
         } finally {
             Files.deleteIfExists(file);
         }
@@ -107,9 +143,11 @@ public class LargeTrafficDetectorTest {
 
             Assert.assertEquals(1, result.getAlerts().size());
             Map<String, Object> detail = result.getAlerts().get(0).getAnomalyDetail();
-            Assert.assertEquals("PAIR_EMA", detail.get("baseline_source"));
-            Assert.assertEquals(3L, ((Number) detail.get("pair_sample_count")).longValue());
-            Assert.assertEquals("SKIP_ANOMALOUS_MATURE", detail.get("pair_learning_mode"));
+            Assert.assertEquals(8, detail.size());
+            Assert.assertEquals(100L, ((Number) detail.get("baseline_bytes")).longValue());
+            Assert.assertEquals(1L, ((Number) detail.get("baseline_pkts")).longValue());
+            Assert.assertEquals("BYTES_AND_PKTS", detail.get("anomaly_reason"));
+            Assert.assertFalse(detail.containsKey("pair_learning_mode"));
             Assert.assertFalse(detail.containsKey("pair_learning_cap_bytes"));
             Assert.assertFalse(detail.containsKey("pair_learning_cap_pkts"));
 

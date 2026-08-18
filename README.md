@@ -85,6 +85,46 @@ alert.device.id=123456
 
 18 位序号理论容量为 `0 ~ 999999999999999999`；即使每天告警接近百亿，容量也远远足够。
 
+## type=2 anomalyDetail：精简后的对外字段
+
+`anomalyType=2` 的检测算法内部仍然使用 Context P50/P90、高分位、Pair EMA、multiplier 和冷启动学习模式等信息，
+但这些属于算法实现细节，不再全部写入对外告警。
+
+当前对外只保留 8 个字段：
+
+```json
+{
+  "current_bytes": 796306,
+  "current_pkts": 636,
+  "baseline_bytes": 100,
+  "baseline_pkts": 1,
+  "bytes_threshold": 395122.0,
+  "pkts_threshold": 649.0,
+  "extreme_bytes_threshold": 790244.0,
+  "anomaly_reason": "EXTREME_BYTES"
+}
+```
+
+字段含义：
+
+- `current_bytes` / `current_pkts`：当前记录的字节数、包数；
+- `baseline_bytes` / `baseline_pkts`：本次判定采用的参考基线；
+- `bytes_threshold` / `pkts_threshold`：算法计算后的最终普通异常阈值；
+- `extreme_bytes_threshold`：极端大字节流量阈值；
+- `anomaly_reason`：最终告警原因。
+
+`anomaly_reason` 只有两个值：
+
+```text
+BYTES_AND_PKTS  -> bytes 和 pkts 均超过最终异常阈值
+EXTREME_BYTES   -> bytes 超过普通阈值且达到极端大流量阈值，pkts 无需同时超限
+```
+
+不再对外输出 `baseline_source`、`context_*`、`*_multiplier`、`pair_learning_*`、
+`bytes_anomaly/pkts_anomaly/extreme_bytes` 等算法调试字段。修改只影响告警 JSON，**不改变 type=2 的实际判定与历史学习算法**。
+
+---
+
 ## 2. 项目信息
 
 - Maven artifact：`NetTrafficSentinel`
