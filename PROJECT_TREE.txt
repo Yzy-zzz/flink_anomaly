@@ -38,6 +38,8 @@ NetTrafficSentinel-beginner-commented/
                   WindowAnalysisResult.java
                 sink/
                   AlertJsonMapper.java
+                  KafkaConnectivityProbe.java
+                  KafkaLoggingProducerInterceptor.java
                   KafkaSinkFactory.java
                   LocalLogSink.java
                   NoOpStringSink.java

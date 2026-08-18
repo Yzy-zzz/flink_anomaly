@@ -571,6 +571,11 @@ source.start.time=2026-08-15 00:00:00
 ```properties
 alert.output.log.enabled=true
 alert.output.kafka.enabled=false
+
+# Kafka 使用 SASL_PLAINTEXT + Kerberos/GSSAPI 时：
+kafka.security.protocol=SASL_PLAINTEXT
+kafka.sasl.kerberos.service.name=kafka
+kafka.sasl.mechanism=GSSAPI
 ```
 
 等追上以后再启 Kafka。
@@ -634,6 +639,75 @@ source.doris.stable.delay.minutes
 ```
 
 是否仍然太小。
+
+---
+
+### Kafka 连接与发送结果
+
+当：
+
+```properties
+alert.output.kafka.enabled=true
+```
+
+建议同时保持：
+
+```properties
+kafka.monitor.connection.check.enabled=true
+kafka.monitor.connection.timeout.ms=10000
+kafka.monitor.connection.fail-fast=false
+kafka.monitor.delivery.log.enabled=true
+kafka.client.id=net-traffic-sentinel-alert
+```
+
+TaskManager 启动 Kafka 输出分支时会先执行一次 Kafka 元数据探测：
+
+```text
+KAFKA_CONNECTION_CHECK_START bootstrapServers=... topic=... timeoutMs=10000 ...
+KAFKA_CONNECTION_OK bootstrapServers=... topic=... clusterId=... brokerCount=3 partitions=6 ...
+```
+
+如果网络、Kerberos/SASL 或 topic 元数据访问失败，会看到：
+
+```text
+KAFKA_CONNECTION_FAILED bootstrapServers=... topic=... errorType=... errorMessage=...
+```
+
+`kafka.monitor.connection.fail-fast=false` 时只记录探测失败，仍交给 KafkaSink 自己继续连接/重试；改成 `true` 时探测失败会直接让该 operator 启动失败，从而触发 Flink 的失败恢复。
+
+真正发送告警时，Kafka Producer interceptor 会记录每条待发送数据的字节数：
+
+```text
+KAFKA_SEND_ATTEMPT clientId=net-traffic-sentinel-alert topic=anomaly_alert bytes=1248 ... attemptedRecords=18 attemptedBytes=22340 inFlight=1
+```
+
+Kafka broker ACK 成功后会记录：
+
+```text
+KAFKA_SEND_SUCCESS clientId=net-traffic-sentinel-alert topic=anomaly_alert partition=2 offset=991 bytes=1248 successRecords=18 successBytes=22340 failedRecords=0 inFlight=0
+```
+
+第一次收到真实 broker ACK 时还会额外记录：
+
+```text
+KAFKA_WRITE_VERIFIED ... message=First broker acknowledgement received; Kafka connection/auth/topic write path is working
+```
+
+最终发送失败时会记录：
+
+```text
+KAFKA_SEND_FAILED clientId=... failedRecords=1 successRecords=18 attemptedRecords=19 attemptedBytes=... errorType=... errorMessage=...
+```
+
+其中：
+
+- `KAFKA_CONNECTION_OK`：证明运行 TaskManager 能连接 Kafka、完成当前 SASL/Kerberos 认证并读取目标 topic 元数据；
+- `KAFKA_WRITE_VERIFIED` / `KAFKA_SEND_SUCCESS`：证明 Producer 已收到 broker 对该 record 的成功 ACK；
+- `KAFKA_SEND_FAILED`：表示 Producer 在内部重试后仍未成功发送；
+- `bytes`：当前 record 的序列化 key + value 字节数；
+- `successRecords/successBytes/failedRecords`：当前 Producer 实例启动以来的累计统计。
+
+如果使用 `kafka.delivery.guarantee=exactly_once`，`KAFKA_SEND_SUCCESS` 表示 record 已获得 Producer ACK，但事务最终提交/对 read_committed consumer 可见仍以 Flink checkpoint 成功提交为准。
 
 ---
 

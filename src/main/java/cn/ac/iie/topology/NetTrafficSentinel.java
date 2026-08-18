@@ -3,6 +3,7 @@ package cn.ac.iie.topology;
 import cn.ac.iie.anomaly.config.AppConfig;
 import cn.ac.iie.anomaly.model.AlertRecord;
 import cn.ac.iie.anomaly.sink.AlertJsonMapper;
+import cn.ac.iie.anomaly.sink.KafkaConnectivityProbe;
 import cn.ac.iie.anomaly.sink.KafkaSinkFactory;
 import cn.ac.iie.anomaly.sink.LocalLogSink;
 import cn.ac.iie.anomaly.sink.NoOpStringSink;
@@ -49,6 +50,15 @@ public class NetTrafficSentinel {
                 config.getBoolean("alert.output.log.enabled", true),
                 config.getBoolean("alert.output.kafka.enabled", false));
 
+        if (config.getBoolean("alert.output.kafka.enabled", false)) {
+            LOG.info("Kafka output enabled: bootstrapServers={}, topic={}, securityProtocol={}, saslMechanism={}, kerberosServiceName={}",
+                    config.get("kafka.bootstrap.servers", "localhost:9092"),
+                    config.get("kafka.topic", "anomaly_alert"),
+                    config.get("kafka.security.protocol", "SASL_PLAINTEXT"),
+                    config.get("kafka.sasl.mechanism", "GSSAPI"),
+                    config.get("kafka.sasl.kerberos.service.name", "kafka"));
+        }
+
         // Flink 的执行环境。可以把它理解成“搭建整条 DataStream 流水线的工作台”。
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
@@ -76,7 +86,11 @@ public class NetTrafficSentinel {
             jsonAlerts.addSink(new LocalLogSink()).name("alert-local-log").uid("alert-local-log-v2");
         }
         if (kafkaEnabled) {
-            jsonAlerts.sinkTo(KafkaSinkFactory.create(config)).name("alert-kafka").uid("alert-kafka-v2");
+            SingleOutputStreamOperator<String> kafkaAlerts = jsonAlerts
+                    .map(new KafkaConnectivityProbe(config))
+                    .name("kafka-connectivity-probe")
+                    .uid("kafka-connectivity-probe-v1");
+            kafkaAlerts.sinkTo(KafkaSinkFactory.create(config)).name("alert-kafka").uid("alert-kafka-v2");
         }
         if (!logEnabled && !kafkaEnabled) {
             jsonAlerts.addSink(new NoOpStringSink()).name("alert-noop").uid("alert-noop-v2");
