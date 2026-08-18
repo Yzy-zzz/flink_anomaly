@@ -642,7 +642,7 @@ source.doris.stable.delay.minutes
 
 ---
 
-### Kafka 连接与发送结果
+### Kafka 连接、5 分钟汇总与发送结果
 
 当：
 
@@ -657,57 +657,72 @@ kafka.monitor.connection.check.enabled=true
 kafka.monitor.connection.timeout.ms=10000
 kafka.monitor.connection.fail-fast=false
 kafka.monitor.delivery.log.enabled=true
+kafka.monitor.delivery.summary.interval.ms=300000
+kafka.monitor.delivery.per-record.log.enabled=false
 kafka.client.id=net-traffic-sentinel-alert
 ```
 
-TaskManager 启动 Kafka 输出分支时会先执行一次 Kafka 元数据探测：
+TaskManager 启动 Kafka 输出分支时先检查集群连通性，再单独检查 topic 元数据：
 
 ```text
-KAFKA_CONNECTION_CHECK_START bootstrapServers=... topic=... timeoutMs=10000 ...
-KAFKA_CONNECTION_OK bootstrapServers=... topic=... clusterId=... brokerCount=3 partitions=6 ...
+KAFKA_CONNECTION_CHECK_START ...
+KAFKA_CONNECTION_OK bootstrapServers=... clusterId=... brokerCount=5 ...
+KAFKA_TOPIC_METADATA_OK topic=anomaly_alert partitions=1 ...
 ```
 
-如果网络、Kerberos/SASL 或 topic 元数据访问失败，会看到：
+如果集群连接已经成功，但启动瞬间 topic 元数据暂时没有准备好，会记录 WARN，而不再误报成 Kafka 整体连接失败：
 
 ```text
-KAFKA_CONNECTION_FAILED bootstrapServers=... topic=... errorType=... errorMessage=...
+KAFKA_TOPIC_METADATA_NOT_READY topic=anomaly_alert ...
 ```
 
-`kafka.monitor.connection.fail-fast=false` 时只记录探测失败，仍交给 KafkaSink 自己继续连接/重试；改成 `true` 时探测失败会直接让该 operator 启动失败，从而触发 Flink 的失败恢复。
-
-真正发送告警时，Kafka Producer interceptor 会记录每条待发送数据的字节数：
+真正的网络/SASL/Kerberos/集群元数据连接失败才记录：
 
 ```text
-KAFKA_SEND_ATTEMPT clientId=net-traffic-sentinel-alert topic=anomaly_alert bytes=1248 ... attemptedRecords=18 attemptedBytes=22340 inFlight=1
+KAFKA_CONNECTION_FAILED bootstrapServers=... errorType=... errorMessage=...
 ```
 
-Kafka broker ACK 成功后会记录：
+业务检测侧，每处理完一个 Doris 5 分钟窗口会输出一条汇总：
 
 ```text
-KAFKA_SEND_SUCCESS clientId=net-traffic-sentinel-alert topic=anomaly_alert partition=2 offset=991 bytes=1248 successRecords=18 successBytes=22340 failedRecords=0 inFlight=0
+ALERT_WINDOW_SUMMARY window=[2026-08-18 20:35:00,2026-08-18 20:40:00) rows=... totalAlerts=14830 anomalyTypeKinds=2 anomalyTypeCounts={2=14730, 3=100} ...
 ```
 
-第一次收到真实 broker ACK 时还会额外记录：
+其中 `totalAlerts` 是该业务 5 分钟窗口产生的告警总数，`anomalyTypeCounts` 是各异常类型的精确数量。
+
+Kafka Producer 默认不再打印每条 `KAFKA_SEND_ATTEMPT` / `KAFKA_SEND_SUCCESS`。发送统计按 5 分钟聚合输出：
+
+```text
+KAFKA_DELIVERY_SUMMARY clientId=net-traffic-sentinel-alert intervalStart=2026-08-18 20:40:00 intervalEnd=2026-08-18 20:45:00 intervalMs=300000 attemptedRecords=14830 successfulRecords=14830 failedRecords=0 attemptedBytes=6379839 successBytes=6379839 avgSuccessBytes=430 inFlight=0 totalAttemptedRecords=14830 totalSuccessfulRecords=14830 totalFailedRecords=0
+```
+
+第一次收到真实 broker ACK 时仍会额外记录一次：
 
 ```text
 KAFKA_WRITE_VERIFIED ... message=First broker acknowledgement received; Kafka connection/auth/topic write path is working
 ```
 
-最终发送失败时会记录：
+最终发送失败会在当前 5 分钟传输区间内立即记录第一条 ERROR，其余失败只累计到汇总，避免 Kafka 故障时 ERROR 再次刷屏：
 
 ```text
-KAFKA_SEND_FAILED clientId=... failedRecords=1 successRecords=18 attemptedRecords=19 attemptedBytes=... errorType=... errorMessage=...
+KAFKA_SEND_FAILED clientId=... failedRecords=1 successRecords=... attemptedRecords=... errorType=... errorMessage=... message=First send failure in current summary interval; remaining failures are aggregated
 ```
 
-其中：
+如果临时排障确实需要恢复逐条 Kafka 日志，可以设置：
 
-- `KAFKA_CONNECTION_OK`：证明运行 TaskManager 能连接 Kafka、完成当前 SASL/Kerberos 认证并读取目标 topic 元数据；
-- `KAFKA_WRITE_VERIFIED` / `KAFKA_SEND_SUCCESS`：证明 Producer 已收到 broker 对该 record 的成功 ACK；
-- `KAFKA_SEND_FAILED`：表示 Producer 在内部重试后仍未成功发送；
-- `bytes`：当前 record 的序列化 key + value 字节数；
-- `successRecords/successBytes/failedRecords`：当前 Producer 实例启动以来的累计统计。
+```properties
+kafka.monitor.delivery.per-record.log.enabled=true
+```
 
-如果使用 `kafka.delivery.guarantee=exactly_once`，`KAFKA_SEND_SUCCESS` 表示 record 已获得 Producer ACK，但事务最终提交/对 read_committed consumer 可见仍以 Flink checkpoint 成功提交为准。
+注意：`ALERT_WINDOW_SUMMARY` 是 Doris 的**业务 5 分钟检测窗口**；`KAFKA_DELIVERY_SUMMARY` 是 Producer 的**传输时间 5 分钟汇总**。由于 Kafka ACK 是异步返回的，这两条日志不能强行假设为逐条一一对应，但前者能精确看异常类型分布，后者能精确看 ACK 成功/失败和发送字节数。
+
+如果 `alert.output.log.enabled=true`，`LocalLogSink` 仍会逐条打印 `ANOMALY_ALERT`。只希望保留窗口汇总和 Kafka 汇总时，可设置：
+
+```properties
+alert.output.log.enabled=false
+```
+
+如果使用 `kafka.delivery.guarantee=exactly_once`，Kafka ACK 成功表示 record 已被 Producer/broker 接收；事务最终提交和 `read_committed` consumer 可见性仍以 Flink checkpoint 成功为准。
 
 ---
 

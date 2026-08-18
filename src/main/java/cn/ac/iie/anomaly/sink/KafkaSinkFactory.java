@@ -37,7 +37,8 @@ public final class KafkaSinkFactory {
 
         LOG.info(
                 "Creating Kafka alert sink: bootstrapServers={}, topic={}, deliveryGuarantee={}, clientId={}, "
-                        + "securityProtocol={}, saslMechanism={}, kerberosServiceName={}, deliveryResultLogging={}",
+                        + "securityProtocol={}, saslMechanism={}, kerberosServiceName={}, deliveryMonitoring={}, "
+                        + "deliverySummaryIntervalMs={}, perRecordDeliveryLogging={}",
                 bootstrapServers,
                 topic,
                 delivery,
@@ -45,7 +46,9 @@ public final class KafkaSinkFactory {
                 producerProperties.getProperty("security.protocol"),
                 producerProperties.getProperty("sasl.mechanism"),
                 producerProperties.getProperty("sasl.kerberos.service.name"),
-                config.getBoolean("kafka.monitor.delivery.log.enabled", true));
+                config.getBoolean("kafka.monitor.delivery.log.enabled", true),
+                config.getLong("kafka.monitor.delivery.summary.interval.ms", 300000L),
+                config.getBoolean("kafka.monitor.delivery.per-record.log.enabled", false));
 
         KafkaSinkBuilder<String> builder = KafkaSink.<String>builder()
                 .setBootstrapServers(bootstrapServers)
@@ -93,6 +96,12 @@ public final class KafkaSinkFactory {
             properties.put(
                     ProducerConfig.INTERCEPTOR_CLASSES_CONFIG,
                     KafkaLoggingProducerInterceptor.class.getName());
+            properties.put(
+                    KafkaLoggingProducerInterceptor.SUMMARY_INTERVAL_MS_CONFIG,
+                    String.valueOf(config.getLong("kafka.monitor.delivery.summary.interval.ms", 300000L)));
+            properties.put(
+                    KafkaLoggingProducerInterceptor.PER_RECORD_LOG_ENABLED_CONFIG,
+                    String.valueOf(config.getBoolean("kafka.monitor.delivery.per-record.log.enabled", false)));
         }
 
         return properties;

@@ -31,6 +31,8 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.regex.Pattern;
 
 /**
@@ -226,11 +228,14 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
                 processedWindows.inc();
                 queriedRows.inc(result.rowCount);
                 consecutiveFailures = 0;
-                LOG.info("Window finished: {}, rows={}, offHoursRows={}, alerts={}, contexts={}, "
-                                + "pairHistoryEntries={}, contextHistoryBuckets={}, nextCursor={}",
+
+                Map<Integer, Long> anomalyTypeCounts = summarizeAnomalyTypes(result.analysis.getAlerts());
+                LOG.info("ALERT_WINDOW_SUMMARY window={} rows={} offHoursRows={} totalAlerts={} "
+                                + "anomalyTypeKinds={} anomalyTypeCounts={} contexts={} pairHistoryEntries={} "
+                                + "contextHistoryBuckets={} nextCursor={}",
                         window, result.rowCount, result.offHoursRowCount, result.analysis.getAlerts().size(),
-                        result.contextCount, historyStore.pairSize(), historyStore.contextBucketSize(),
-                        nextWindowStart.format(WindowRange.DATETIME));
+                        anomalyTypeCounts.size(), anomalyTypeCounts, result.contextCount, historyStore.pairSize(),
+                        historyStore.contextBucketSize(), nextWindowStart.format(WindowRange.DATETIME));
             } catch (SQLException e) {
                 queryFailures.inc();
                 consecutiveFailures++;
@@ -243,6 +248,14 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
                 sleepInterruptibly(retryMillis);
             }
         }
+    }
+
+    private static Map<Integer, Long> summarizeAnomalyTypes(List<AlertRecord> alerts) {
+        Map<Integer, Long> counts = new TreeMap<>();
+        for (AlertRecord alert : alerts) {
+            counts.merge(alert.getAnomalyType(), 1L, Long::sum);
+        }
+        return counts;
     }
 
     private LocalDateTime initialCursorFromDataWatermark(LocalDateTime safeWindowEnd, int windowMinutes) {
