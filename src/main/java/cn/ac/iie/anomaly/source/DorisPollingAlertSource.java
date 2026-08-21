@@ -107,6 +107,8 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
     private transient LocalDateTime cachedDorisMaxCollectTime;
     private transient LocalDateTime cachedSafeWindowEnd;
     private transient long nextWatermarkRefreshAt;
+    private transient LocalDate lastWatermarkQueryLower;
+    private transient LocalDate lastWatermarkQueryUpper;
 
     public DorisPollingAlertSource(AppConfig config) {
         this.config = config;
@@ -280,7 +282,10 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
      */
     private void refreshDataWatermarkIfNeeded(long pollMillis) throws SQLException {
         long now = System.currentTimeMillis();
-        if (cachedSafeWindowEnd != null && now < nextWatermarkRefreshAt) {
+        // Polling cadence must not depend on whether the previous query returned a non-null watermark.
+        // Otherwise a NULL MAX(collectTime) clears cachedSafeWindowEnd and accidentally falls back to
+        // the much faster source.poll.interval.seconds loop.
+        if (now < nextWatermarkRefreshAt) {
             return;
         }
 
@@ -290,23 +295,49 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
         if (maxCollectTime == null) {
             cachedDorisMaxCollectTime = null;
             cachedSafeWindowEnd = null;
-            LOG.warn("Doris watermark query returned NULL MAX(collectTime). Waiting for data.");
+            LOG.warn("Doris watermark query returned NULL MAX(collectTime) for dayTime range [{}, {}]. "
+                            + "Waiting for data. cursor={}",
+                    lastWatermarkQueryLower, lastWatermarkQueryUpper, formatNullable(nextWindowStart));
             return;
         }
 
         int stableDelayMinutes = Math.max(0, config.getInt("source.doris.stable.delay.minutes", 60));
         int windowMinutes = config.getInt("window.size.minutes", 5);
-        LocalDateTime safeEnd = WindowRange.floorToWindow(
-                maxCollectTime.minusMinutes(stableDelayMinutes), windowMinutes);
+        boolean historicalTailReleaseEnabled = config.getBoolean(
+                "source.doris.historical.tail.release.enabled", true);
+        int historicalTailReleaseAfterMinutes = Math.max(0, config.getInt(
+                "source.doris.historical.tail.release.after.minutes", 1440));
+        LocalDateTime businessNow = ZonedDateTime.now(Clock.systemUTC())
+                .withZoneSameInstant(zoneId)
+                .toLocalDateTime();
+        LocalDateTime safeEnd = calculateSafeWindowEnd(
+                maxCollectTime,
+                businessNow,
+                stableDelayMinutes,
+                windowMinutes,
+                historicalTailReleaseEnabled,
+                historicalTailReleaseAfterMinutes);
+        boolean historicalTailReleased = historicalTailReleaseEnabled
+                && !maxCollectTime.isAfter(businessNow.minusMinutes(historicalTailReleaseAfterMinutes))
+                && safeEnd.equals(WindowRange.floorToWindow(maxCollectTime, windowMinutes));
 
         boolean changed = !maxCollectTime.equals(cachedDorisMaxCollectTime)
                 || !safeEnd.equals(cachedSafeWindowEnd);
         cachedDorisMaxCollectTime = maxCollectTime;
         cachedSafeWindowEnd = safeEnd;
         if (changed) {
-            LOG.info("Doris data watermark updated: maxCollectTime={}, stableDelay={}m, safeWindowEnd={}, cursor={}",
+            LOG.info("Doris data watermark updated: maxCollectTime={}, stableDelay={}m, safeWindowEnd={}, cursor={}, "
+                            + "queryDayRange=[{}, {}], historicalTailReleased={}",
                     maxCollectTime.format(WindowRange.DATETIME), stableDelayMinutes,
-                    safeEnd.format(WindowRange.DATETIME), formatNullable(nextWindowStart));
+                    safeEnd.format(WindowRange.DATETIME), formatNullable(nextWindowStart),
+                    lastWatermarkQueryLower, lastWatermarkQueryUpper, historicalTailReleased);
+        } else {
+            // Keep a low-frequency heartbeat in INFO so a caught-up source does not look hung.
+            LOG.info("Doris data watermark unchanged: maxCollectTime={}, safeWindowEnd={}, cursor={}, "
+                            + "queryDayRange=[{}, {}], historicalTailReleased={}. Waiting for the next mature window.",
+                    maxCollectTime.format(WindowRange.DATETIME), safeEnd.format(WindowRange.DATETIME),
+                    formatNullable(nextWindowStart), lastWatermarkQueryLower, lastWatermarkQueryUpper,
+                    historicalTailReleased);
         }
     }
 
@@ -314,7 +345,14 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
         String table = validatedTable();
         int lookbackDays = Math.max(1, config.getInt("source.watermark.lookback.days", 3));
         LocalDate today = ZonedDateTime.now(Clock.systemUTC()).withZoneSameInstant(zoneId).toLocalDate();
-        LocalDate lower = today.minusDays(lookbackDays - 1L);
+        LocalDate lower = resolveWatermarkLowerDate(
+                today,
+                lookbackDays,
+                nextWindowStart,
+                config.get("source.start.mode", "latest_data"),
+                config.get("source.start.time", ""));
+        lastWatermarkQueryLower = lower;
+        lastWatermarkQueryUpper = today;
         String sql = "SELECT MAX(collectTime) FROM " + table
                 + " WHERE dayTime >= '" + lower + "' AND dayTime <= '" + today + "'";
 
@@ -339,6 +377,71 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
         } finally {
             currentConnection = null;
         }
+    }
+
+    /**
+     * 计算安全窗口结束时间。
+     *
+     * 常规实时数据仍使用 floor(MAX(collectTime) - stableDelay)。
+     * 但如果 MAX(collectTime) 已经长时间没有推进，且本身已经是很久以前的历史数据，
+     * 继续减 stableDelay 会永久留下一个“尾巴”（例如 MAX=16:57、delay=60m 时永远只到 15:55）。
+     * 对这种历史停滞数据，可在达到配置的 wall-clock 年龄后释放到 floor(MAX)，但绝不越过 MAX 所在
+     * 的完整 5 分钟边界，因此不会处理 MAX 之后的未知窗口。
+     */
+    static LocalDateTime calculateSafeWindowEnd(
+            LocalDateTime maxCollectTime,
+            LocalDateTime businessNow,
+            int stableDelayMinutes,
+            int windowMinutes,
+            boolean historicalTailReleaseEnabled,
+            int historicalTailReleaseAfterMinutes) {
+        int normalizedStableDelayMinutes = Math.max(0, stableDelayMinutes);
+        int normalizedReleaseAfterMinutes = Math.max(0, historicalTailReleaseAfterMinutes);
+        LocalDateTime normalSafeEnd = WindowRange.floorToWindow(
+                maxCollectTime.minusMinutes(normalizedStableDelayMinutes), windowMinutes);
+
+        if (!historicalTailReleaseEnabled) {
+            return normalSafeEnd;
+        }
+
+        LocalDateTime staleBeforeOrAt = businessNow.minusMinutes(normalizedReleaseAfterMinutes);
+        if (maxCollectTime.isAfter(staleBeforeOrAt)) {
+            return normalSafeEnd;
+        }
+
+        LocalDateTime historicalSafeEnd = WindowRange.floorToWindow(maxCollectTime, windowMinutes);
+        return historicalSafeEnd.isAfter(normalSafeEnd) ? historicalSafeEnd : normalSafeEnd;
+    }
+
+    /**
+     * Watermark 查询的 dayTime 下界必须覆盖“真正还需要处理的数据”。
+     *
+     * 正常情况下使用 recent lookback；但如果 checkpoint cursor 更老，必须向前扩展到 cursor 日期。
+     * 对于没有 checkpoint 的 fixed 启动模式，首次 watermark 查询时 cursor 尚未初始化，因此还必须
+     * 覆盖 source.start.time 的日期。否则一旦跨过 lookback 边界，旧实现会在首次查询时直接漏掉
+     * fixed 起始日期，并可能永久得到 NULL MAX(collectTime)。
+     */
+    static LocalDate resolveWatermarkLowerDate(
+            LocalDate today,
+            int lookbackDays,
+            LocalDateTime cursor,
+            String startMode,
+            String fixedStartTime) {
+        int normalizedLookbackDays = Math.max(1, lookbackDays);
+        LocalDate lookbackLower = today.minusDays(normalizedLookbackDays - 1L);
+
+        LocalDate requiredLower = cursor == null ? null : cursor.toLocalDate();
+        if (requiredLower == null && "fixed".equalsIgnoreCase(startMode)) {
+            if (fixedStartTime == null || fixedStartTime.trim().isEmpty()) {
+                throw new IllegalArgumentException("source.start.time is required when source.start.mode=fixed");
+            }
+            requiredLower = LocalDateTime.parse(fixedStartTime.trim(), WindowRange.DATETIME).toLocalDate();
+        }
+
+        if (requiredLower != null && requiredLower.isBefore(lookbackLower)) {
+            return requiredLower;
+        }
+        return lookbackLower;
     }
 
     /**

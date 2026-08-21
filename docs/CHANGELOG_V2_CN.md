@@ -1,5 +1,14 @@
 # V2 修改说明
 
+## 2026-08-20 Watermark 跨日与 NULL 轮询修复
+
+1. 修复 `source.watermark.lookback.days` 随自然日滑动后可能把尚未处理完的历史 cursor 日期排除的问题。
+2. Watermark 查询下界现在会自动覆盖 checkpoint 恢复的 cursor 日期。
+3. `source.start.mode=fixed` 且首次启动尚无 cursor 时，查询下界会自动覆盖 `source.start.time` 日期。
+4. 修复 `MAX(collectTime)=NULL` 后 `source.watermark.poll.interval.seconds` 失效、退化为主循环每 15 秒查询的问题。
+5. Watermark INFO/WARN 日志增加实际 `queryDayRange`，并在水位未变化时输出低频 heartbeat，便于区分“正常等待”和“线程停止”。
+6. 新增历史尾部释放：当 `MAX(collectTime)` 已比当前业务时间旧至少 1440 分钟时，安全水位可推进到 `floor5min(MAX)`，避免 `MAX - stableDelay` 永久留下最后一小时历史数据；可通过配置关闭。
+
 本版本针对 Doris 延迟入库和 type=2 baseline 语义完成以下修改：
 
 1. Source 从“系统时间驱动”改为“Doris 数据 Watermark 驱动”。
