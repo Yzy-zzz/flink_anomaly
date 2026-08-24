@@ -48,23 +48,37 @@ public final class WindowRange implements Serializable {
     }
 
     /**
-     * Doris predicates deliberately include all three time columns:
-     * dayTime/dayHourTime help partition pruning; collectTime defines the exact window.
+     * Doris predicates deliberately include all three sort/partition time columns.
+     *
+     * metric_endpoint stores dayHourTime as the exact hour boundary (for example 10:00:00 for
+     * every row in partition pYYYYMMDD10).  Using equality on dayTime/dayHourTime and a range on
+     * collectTime matches the table sort-key prefix (dayTime, dayHourTime, collectTime) better than
+     * using a broad one-hour range on dayHourTime.
      */
     public String toDorisFilter() {
-        LocalDateTime lowerHour = start.truncatedTo(ChronoUnit.HOURS);
-        LocalDateTime upperHour = end.truncatedTo(ChronoUnit.HOURS);
-        if (!upperHour.equals(end)) {
-            upperHour = upperHour.plusHours(1);
+        return toDorisFilter(start, end);
+    }
+
+    /** Builds the same optimized Doris predicate for a sub-range inside this business window. */
+    public String toDorisFilter(LocalDateTime queryStart, LocalDateTime queryEnd) {
+        if (queryStart == null || queryEnd == null || !queryEnd.isAfter(queryStart)) {
+            throw new IllegalArgumentException("queryEnd must be after queryStart");
         }
-        String startDate = start.toLocalDate().format(DATE);
-        String endDate = end.minusNanos(1).toLocalDate().format(DATE);
-        return "dayTime >= '" + startDate + "'"
-                + " AND dayTime <= '" + endDate + "'"
-                + " AND dayHourTime >= '" + lowerHour.format(DATETIME) + "'"
-                + " AND dayHourTime < '" + upperHour.format(DATETIME) + "'"
-                + " AND collectTime >= '" + start.format(DATETIME) + "'"
-                + " AND collectTime < '" + end.format(DATETIME) + "'";
+        if (queryStart.isBefore(start) || queryEnd.isAfter(end)) {
+            throw new IllegalArgumentException("query range must stay inside window " + this);
+        }
+
+        LocalDateTime hour = queryStart.truncatedTo(ChronoUnit.HOURS);
+        LocalDateTime lastIncluded = queryEnd.minusNanos(1);
+        if (!lastIncluded.truncatedTo(ChronoUnit.HOURS).equals(hour)) {
+            throw new IllegalArgumentException("query range must stay inside one Doris hourly partition");
+        }
+
+        String day = queryStart.toLocalDate().format(DATE);
+        return "dayTime = '" + day + "'"
+                + " AND dayHourTime = '" + hour.format(DATETIME) + "'"
+                + " AND collectTime >= '" + queryStart.format(DATETIME) + "'"
+                + " AND collectTime < '" + queryEnd.format(DATETIME) + "'";
     }
 
     public LocalDateTime getStart() { return start; }

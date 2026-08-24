@@ -37,6 +37,16 @@ public class MetricRecord implements Serializable {
         this.s2cBytes = s2cBytes;
     }
 
+    /**
+     * Compact constructor used by the Doris source after the SQL has already merged C2S/S2C
+     * packet and byte counters.  The public totalPkts()/totalBytes() semantics stay unchanged.
+     */
+    public MetricRecord(String collectTime, long collectTimestamp, String srcIp, String dstIp, String protocol,
+                        long connCount, long totalPkts, long totalBytes) {
+        this(collectTime, collectTimestamp, srcIp, dstIp, protocol, connCount,
+                totalPkts, 0L, totalBytes, 0L);
+    }
+
     /** 总字节数 = 客户端到服务端 + 服务端到客户端。 */
     public long totalBytes() {
         return safeAdd(c2sBytes, s2cBytes);

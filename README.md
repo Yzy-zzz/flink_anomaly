@@ -475,6 +475,35 @@ Pair EMA 历史
 
 ---
 
+## 8.1 Doris 大数据量读取降压
+
+`metric_endpoint` 当前按 `dayHourTime` 小时分区，并且 `dayHourTime` 在分区内是整点值。Source 因此使用：
+
+```sql
+WHERE dayTime = '2026-08-21'
+  AND dayHourTime = '2026-08-21 10:00:00'
+  AND collectTime >= '2026-08-21 10:00:00'
+  AND collectTime <  '2026-08-21 10:01:00'
+```
+
+而不是对 `dayHourTime` 做一小时范围过滤。这样更贴合 `(dayTime, dayHourTime, collectTime)` 的排序键前缀。
+
+为了避免单条 5 分钟 SQL 一次返回约 700~800 万行，业务窗口仍保持 5 分钟，但 JDBC 默认按 60 秒切成 5 条 SQL；所有切片共享同一个 `FiveMinuteWindowAnalyzer`，最后只 `finish()` 一次，因此告警算法语义不变。默认配置：
+
+```properties
+source.doris.query.slice.seconds=60
+source.doris.slice.pause.millis=1000
+source.catchup.pause.seconds=5
+
+doris.query.resource.limit.enabled=true
+doris.query.parallelism=1
+doris.query.scanner.threads=1
+```
+
+`parallel_pipeline_task_num` 和 `num_scanner_threads` 通过 JDBC Session 的 `SET` 设置，只影响本 Source 建立的 Doris 连接，不修改集群全局变量。若 60 秒切片仍对共享 Doris 造成明显压力，可先把 `source.doris.query.slice.seconds` 调成 `30`，而不是使用 `LIMIT/OFFSET`。
+
+查询字段也由 9 列降为 7 列：Doris 侧直接计算 `totalPkts` / `totalBytes`，减少 JDBC 返回结果和 Flink 解析开销。每个切片都会记录实际 `rows` 和 `elapsedMs`，上线后可以据此决定切片大小。
+
 ## 9. 强烈建议配置 HDFS checkpoint
 
 不要长期使用日志中的：
@@ -608,12 +637,15 @@ stableDelay=60m,
 safeWindowEnd=2026-08-17 11:35:00
 ```
 
-### 开始窗口
+### 开始窗口与切片
 
 ```text
-Start Doris five-minute query:
-window=[2026-08-17 11:30:00, 2026-08-17 11:35:00)
+Start Doris window query: window=[2026-08-17 11:30:00, 2026-08-17 11:35:00), sliceSeconds=60 ...
+Start Doris slice query: window=[2026-08-17 11:30:00, 2026-08-17 11:35:00), slice=[2026-08-17 11:30:00, 2026-08-17 11:31:00) ...
+Doris slice completed: ... rows=1500000, elapsedMs=...
 ```
+
+这里的 `rows` 和 `elapsedMs` 是调节 `source.doris.query.slice.seconds` 的主要依据。
 
 ### 窗口完成
 

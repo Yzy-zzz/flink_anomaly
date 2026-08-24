@@ -70,10 +70,8 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
             "dstIp",
             "protocol",
             "connCount",
-            "c2sPkts",
-            "s2cPkts",
-            "c2sBytes",
-            "s2cBytes");
+            "GREATEST(COALESCE(c2sPkts, 0), 0) + GREATEST(COALESCE(s2cPkts, 0), 0) AS totalPkts",
+            "GREATEST(COALESCE(c2sBytes, 0), 0) + GREATEST(COALESCE(s2cBytes, 0), 0) AS totalBytes");
 
     private final AppConfig config;
 
@@ -158,6 +156,8 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
                 config.getLong("source.empty.window.retry.seconds", 300L) * 1000L);
         final boolean advanceEmptyWindow = config.getBoolean("source.empty.window.advance", false);
         final int maxFailures = Math.max(1, config.getInt("source.retry.max.failures", 10));
+        final long catchupPauseMillis = Math.max(0L,
+                config.getLong("source.catchup.pause.seconds", 5L) * 1000L);
         int consecutiveFailures = 0;
 
         if (nextWindowStart != null) {
@@ -238,6 +238,16 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
                         window, result.rowCount, result.offHoursRowCount, result.analysis.getAlerts().size(),
                         anomalyTypeCounts.size(), anomalyTypeCounts, result.contextCount, historyStore.pairSize(),
                         historyStore.contextBucketSize(), nextWindowStart.format(WindowRange.DATETIME));
+
+                // When catching up historical windows, deliberately leave a small quiet gap between
+                // complete five-minute windows so this background job does not continuously occupy Doris.
+                if (catchupPauseMillis > 0L
+                        && cachedSafeWindowEnd != null
+                        && nextWindowStart.isBefore(cachedSafeWindowEnd)) {
+                    LOG.info("Catch-up pause after window {}: {} ms before querying the next mature window.",
+                            window, catchupPauseMillis);
+                    sleepInterruptibly(catchupPauseMillis);
+                }
             } catch (SQLException e) {
                 queryFailures.inc();
                 consecutiveFailures++;
@@ -445,65 +455,49 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
     }
 
     /**
-     * 查询一个 5 分钟 Doris 窗口，并逐行喂给分析器。
-     * JDBC 使用 forward-only 流式读取，避免一次性把数百万/数千万行全部装进 JVM 内存。
+     * 查询一个完整业务窗口，但把数据库访问拆成多个更短的时间片。
+     *
+     * 例如 5 分钟窗口 + 60 秒切片会执行 5 条 SQL。所有切片共用同一个
+     * FiveMinuteWindowAnalyzer，因此最终告警和历史基线仍然按完整 5 分钟窗口计算。
+     * JDBC 继续使用 forward-only streaming，避免把单个切片的一百多万行一次性装入 JVM。
      */
-    private WindowQueryResult queryAndAnalyze(WindowRange window) throws SQLException {
+    private WindowQueryResult queryAndAnalyze(WindowRange window) throws SQLException, InterruptedException {
         String table = validatedTable();
-        String sql = "SELECT " + SELECT_FIELDS + " FROM " + table + " WHERE " + window.toDorisFilter();
         FiveMinuteWindowAnalyzer analyzer = new FiveMinuteWindowAnalyzer(config, historyStore, window);
         long progressEvery = Math.max(0L, config.getLong("source.progress.log.rows", 1000000L));
+        int configuredSliceSeconds = Math.max(1, config.getInt("source.doris.query.slice.seconds", 60));
+        long slicePauseMillis = Math.max(0L, config.getLong("source.doris.slice.pause.millis", 1000L));
         long rows = 0L;
+        int sliceIndex = 0;
 
-        LOG.info("Start Doris five-minute query: window={}, sql={}", window, sql);
+        LOG.info("Start Doris window query: window={}, sliceSeconds={}, slicePauseMs={}, "
+                        + "pipelineParallelism={}, scannerThreads={}, selectColumns=7",
+                window, configuredSliceSeconds, slicePauseMillis,
+                config.getInt("doris.query.parallelism", 1),
+                config.getInt("doris.query.scanner.threads", 1));
         long startedAt = System.currentTimeMillis();
 
         try (Connection connection = newConnection()) {
             currentConnection = connection;
-            try (Statement statement = connection.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
-                currentStatement = statement;
-                if (config.getBoolean("doris.jdbc.streaming.enabled", true)) {
-                    statement.setFetchSize(Integer.MIN_VALUE);
-                } else {
-                    statement.setFetchSize(config.getInt("doris.jdbc.fetch.size", 5000));
-                }
-                int queryTimeoutSeconds = config.getInt("doris.jdbc.query.timeout.seconds", 1800);
-                if (queryTimeoutSeconds > 0) {
-                    statement.setQueryTimeout(queryTimeoutSeconds);
+            LocalDateTime sliceStart = window.getStart();
+            while (running && sliceStart.isBefore(window.getEnd())) {
+                LocalDateTime sliceEnd = sliceStart.plusSeconds(configuredSliceSeconds);
+                if (sliceEnd.isAfter(window.getEnd())) {
+                    sliceEnd = window.getEnd();
                 }
 
-                try (ResultSet rs = statement.executeQuery(sql)) {
-                    while (running && rs.next()) {
-                        try {
-                            TimeUtils.ParsedTime parsedTime = TimeUtils.parse(rs.getObject(1), zoneId);
-                            MetricRecord record = new MetricRecord(
-                                    parsedTime.getText(),
-                                    parsedTime.getEpochMillis(),
-                                    safeString(rs.getString(2)),
-                                    safeString(rs.getString(3)),
-                                    safeString(rs.getString(4)),
-                                    nonNegative(rs.getLong(5)),
-                                    nonNegative(rs.getLong(6)),
-                                    nonNegative(rs.getLong(7)),
-                                    nonNegative(rs.getLong(8)),
-                                    nonNegative(rs.getLong(9)));
-                            // 每读到一行就立即累计到算法结构（t-digest / Top-K heap / Space-Saving），
-                            // 不保存整个 5 分钟窗口的原始数据。
-                            analyzer.add(record, parsedTime.getLocalDateTime());
-                            rows++;
-                            if (progressEvery > 0L && rows % progressEvery == 0L) {
-                                LOG.info("Doris query progress: window={}, rows={}", window, rows);
-                            }
-                        } catch (RuntimeException rowError) {
-                            badRows.inc();
-                            LOG.warn("Skip malformed Doris row in window {}: {}", window, rowError.toString());
-                        }
-                    }
+                sliceIndex++;
+                long sliceRows = querySlice(
+                        connection, table, window, sliceStart, sliceEnd, analyzer, progressEvery);
+                rows += sliceRows;
+
+                sliceStart = sliceEnd;
+                if (running && sliceStart.isBefore(window.getEnd()) && slicePauseMillis > 0L) {
+                    sleepInterruptibly(slicePauseMillis);
                 }
-            } finally {
-                currentStatement = null;
             }
         } finally {
+            currentStatement = null;
             currentConnection = null;
         }
 
@@ -513,14 +507,102 @@ public class DorisPollingAlertSource extends RichParallelSourceFunction<AlertRec
 
         WindowAnalysisResult analysis = analyzer.finish();
         long elapsedMs = System.currentTimeMillis() - startedAt;
-        LOG.info("Doris query analyzed: window={}, rows={}, elapsedMs={}, alerts={}, contexts={}",
-                window, rows, elapsedMs, analysis.getAlerts().size(), analyzer.getLargeContextCount());
+        LOG.info("Doris window analyzed: window={}, slices={}, rows={}, elapsedMs={}, alerts={}, contexts={}",
+                window, sliceIndex, rows, elapsedMs, analysis.getAlerts().size(), analyzer.getLargeContextCount());
         return new WindowQueryResult(rows, analyzer.getOffHoursRowCount(), analyzer.getLargeContextCount(), analysis);
     }
 
+    private long querySlice(
+            Connection connection,
+            String table,
+            WindowRange window,
+            LocalDateTime sliceStart,
+            LocalDateTime sliceEnd,
+            FiveMinuteWindowAnalyzer analyzer,
+            long progressEvery) throws SQLException {
+        String sql = "SELECT " + SELECT_FIELDS + " FROM " + table
+                + " WHERE " + window.toDorisFilter(sliceStart, sliceEnd);
+        long sliceRows = 0L;
+        long startedAt = System.currentTimeMillis();
+
+        LOG.info("Start Doris slice query: window={}, slice=[{}, {}), sql={}",
+                window, sliceStart.format(WindowRange.DATETIME), sliceEnd.format(WindowRange.DATETIME), sql);
+
+        try (Statement statement = connection.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
+            currentStatement = statement;
+            if (config.getBoolean("doris.jdbc.streaming.enabled", true)) {
+                statement.setFetchSize(Integer.MIN_VALUE);
+            } else {
+                statement.setFetchSize(config.getInt("doris.jdbc.fetch.size", 5000));
+            }
+            int queryTimeoutSeconds = config.getInt("doris.jdbc.query.timeout.seconds", 1800);
+            if (queryTimeoutSeconds > 0) {
+                statement.setQueryTimeout(queryTimeoutSeconds);
+            }
+
+            try (ResultSet rs = statement.executeQuery(sql)) {
+                while (running && rs.next()) {
+                    try {
+                        TimeUtils.ParsedTime parsedTime = TimeUtils.parse(rs.getObject(1), zoneId);
+                        MetricRecord record = new MetricRecord(
+                                parsedTime.getText(),
+                                parsedTime.getEpochMillis(),
+                                safeString(rs.getString(2)),
+                                safeString(rs.getString(3)),
+                                safeString(rs.getString(4)),
+                                nonNegative(rs.getLong(5)),
+                                nonNegative(rs.getLong(6)),
+                                nonNegative(rs.getLong(7)));
+                        analyzer.add(record, parsedTime.getLocalDateTime());
+                        sliceRows++;
+                        if (progressEvery > 0L && sliceRows % progressEvery == 0L) {
+                            LOG.info("Doris slice progress: window={}, slice=[{}, {}), rows={}",
+                                    window, sliceStart.format(WindowRange.DATETIME),
+                                    sliceEnd.format(WindowRange.DATETIME), sliceRows);
+                        }
+                    } catch (RuntimeException rowError) {
+                        badRows.inc();
+                        LOG.warn("Skip malformed Doris row in window {}, slice=[{}, {}): {}",
+                                window, sliceStart.format(WindowRange.DATETIME),
+                                sliceEnd.format(WindowRange.DATETIME), rowError.toString());
+                    }
+                }
+            }
+        } finally {
+            currentStatement = null;
+        }
+
+        long elapsedMs = System.currentTimeMillis() - startedAt;
+        LOG.info("Doris slice completed: window={}, slice=[{}, {}), rows={}, elapsedMs={}",
+                window, sliceStart.format(WindowRange.DATETIME),
+                sliceEnd.format(WindowRange.DATETIME), sliceRows, elapsedMs);
+        return sliceRows;
+    }
+
     private Connection newConnection() throws SQLException {
-        return DriverManager.getConnection(
+        Connection connection = DriverManager.getConnection(
                 config.get("doris.jdbc.url"), config.get("doris.username"), config.get("doris.password"));
+        boolean applyLimits = config.getBoolean("doris.query.resource.limit.enabled", true);
+        if (!applyLimits) {
+            return connection;
+        }
+
+        int pipelineParallelism = Math.max(1, config.getInt("doris.query.parallelism", 1));
+        int scannerThreads = Math.max(1, config.getInt("doris.query.scanner.threads", 1));
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("SET parallel_pipeline_task_num = " + pipelineParallelism);
+            statement.execute("SET num_scanner_threads = " + scannerThreads);
+        } catch (SQLException e) {
+            try {
+                connection.close();
+            } catch (SQLException closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw new SQLException(
+                    "Failed to apply Doris session resource limits. "
+                            + "Set doris.query.resource.limit.enabled=false to disable them.", e);
+        }
+        return connection;
     }
 
     private String validatedTable() {
