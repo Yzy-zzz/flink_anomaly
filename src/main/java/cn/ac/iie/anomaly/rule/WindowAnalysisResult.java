@@ -5,7 +5,7 @@ import cn.ac.iie.anomaly.model.AlertRecord;
 
 import java.util.List;
 
-/** Immutable output of one fully consumed Doris five-minute window. */
+/** Immutable output of one finalized Kafka event-time five-minute window. */
 public final class WindowAnalysisResult {
     private final List<AlertRecord> alerts;
     private final HistoricalBaselineStore.WindowUpdate historyUpdate;

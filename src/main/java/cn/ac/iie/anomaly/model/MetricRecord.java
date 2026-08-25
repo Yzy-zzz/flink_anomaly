@@ -3,7 +3,7 @@ package cn.ac.iie.anomaly.model;
 import java.io.Serializable;
 
 /**
- * Doris 一行网络指标在 Java 里的数据对象。
+ * Kafka METRIC-ENDPOINT 一条网络指标 JSON 归一化后的 Java 数据对象。
  * type=2 主要使用 totalBytes() 和 totalPkts()；Pair key 使用 srcIp + dstIp + protocol。
  */
 public class MetricRecord implements Serializable {
@@ -38,8 +38,8 @@ public class MetricRecord implements Serializable {
     }
 
     /**
-     * Compact constructor used by the Doris source after the SQL has already merged C2S/S2C
-     * packet and byte counters.  The public totalPkts()/totalBytes() semantics stay unchanged.
+     * Compact constructor for callers that already merged C2S/S2C packet and byte counters.
+     * The public totalPkts()/totalBytes() semantics stay unchanged.
      */
     public MetricRecord(String collectTime, long collectTimestamp, String srcIp, String dstIp, String protocol,
                         long connCount, long totalPkts, long totalBytes) {

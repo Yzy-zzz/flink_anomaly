@@ -24,7 +24,7 @@ import java.util.TreeMap;
  * - Context History：很多 IP 对共享的分布画像，使用按天 t-digest 桶；
  * - Pair History：某个 srcIp+dstIp+protocol 自己的 EMA。
  *
- * 只有一个 5 分钟窗口完整分析成功后，Source 才调用 apply() 更新这里，所以失败窗口不会留下半截历史。
+ * 只有一个 5 分钟 Kafka 事件时间窗口完整分析成功后，分析算子才调用 apply() 更新这里，所以失败恢复不会留下半截历史。
  *
  * Long-lived historical state used by anomalyType=2.
  *
@@ -33,7 +33,7 @@ import java.util.TreeMap;
  * Pair history:
  *   pairHash -> EMA(bytes/pkts), bounded by event-time TTL and a hard max-entry cap.
  *
- * The store is mutated only after a complete five-minute Doris window has been analyzed.
+ * The store is mutated only after a complete five-minute Kafka event-time window has been finalized.
  */
 public final class HistoricalBaselineStore {
     private final boolean contextEnabled;

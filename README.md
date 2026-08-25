@@ -1,538 +1,296 @@
-# NetTrafficSentinel
+# NetTrafficSentinel（Kafka 输入版）
 
-`NetTrafficSentinel` 是一个基于 **Java 8/11 + Apache Flink 1.17.2 DataStream API** 的常驻网络流量异常检测程序。
+本工程已将原来的 **Doris JDBC 轮询输入**改为 **Flink KafkaSource 持续消费**。异常算法、5 分钟业务窗口、Context 历史基线、Pair EMA、告警 JSON 和 Kafka 输出保持原有语义。
 
-它从 Doris `anomaly_detection.metric_endpoint` 按 **5 分钟数据窗口**持续读取，检测：
-
-1. `anomalyType=2`：异常大流量
-2. `anomalyType=3`：非工作时段活跃连接 Top N
-
-告警可以独立输出到 YARN/TaskManager 日志和 Kafka。
-
----
-
-## 学习版文档
-
-如果你不熟悉 Flink 或想从头理解 type=2 算法，优先阅读：
-
-- `docs/NetTrafficSentinel代码与算法完全指南.docx`：完整 Word 手册；
-- `docs/BEGINNER_CODE_AND_ALGORITHM_GUIDE_CN.md`：同内容 Markdown 版；
-- `src/main/java`：关键主链路源码已经补充“导读”和算法中文注释。
-
-建议阅读顺序：`NetTrafficSentinel -> DorisPollingAlertSource -> FiveMinuteWindowAnalyzer -> LargeTrafficAccumulator -> LargeTrafficDetector -> HistoricalBaselineStore -> AlertRecord`。
-
----
-
-## 1. 本版本解决了什么问题
-
-上一版存在两个现实问题：
-
-- Doris 数据入库可能延迟数小时，不能用“当前系统时间 - 1 分钟”判断哪个窗口已经完整；
-- `baseline_bytes/baseline_pkts` 主要来自当前 5 分钟窗口，不是真正的跨窗口历史基线。
-
-本版本改成：
+默认数据链路：
 
 ```text
-Doris MAX(collectTime)
-        -
-稳定等待时间（默认 60 分钟）
-        ↓
-安全数据 Watermark
-        ↓
-每次只处理一个成熟的 5 分钟窗口
+Kafka METRIC-ENDPOINT
+  -> JSON 校验/归一化
+  -> collectTime 事件时间 + Watermark
+  -> 5 分钟窗口摘要（允许长时间乱序/延迟）
+  -> LargeTraffic / OffHours 检测
+  -> HistoricalBaselineStore
+  -> AlertRecord -> JSON
+  -> Kafka anomaly_alert
 ```
 
-同时 type=2 改成：
+
+## 0. 重要：请解压到全新目录，不要覆盖旧 Doris 工程
+
+如果 Maven 编译日志里还出现：
 
 ```text
-历史 Context t-digest（7 天时间桶）
-                 +
-有限 Pair EMA 历史（7 天 TTL + 20 万硬上限）
-                 ↓
-           异常大流量判断
+cn/ac/iie/anomaly/source/DorisPollingAlertSource.java
 ```
 
-**Context Sketch 不保存 IP Pair。**
+说明你当前构建的目录里仍有旧 Doris 版文件。ZIP 覆盖解压不会删除旧文件。
 
-真正保存 Pair 的只有 Pair EMA History，而且只学习每个 5 分钟窗口固定容量的大流量候选，因此状态不会随全量 IP Pair 基数无限增长。
-
----
-
-
-## 告警 logId：事件记录本地 ID
-
-告警 JSON 中的 `logId` 不再使用固定配置值，而是在 Source 真正输出告警时生成：
+建议把本工程解压成一个新的目录，例如：
 
 ```text
-yyyyMMdd + 6位设备ID + 18位日内自增序号
+D:\Code\B-traffic_behavior\NetTrafficSentinel-Kafka-v2
 ```
 
-总长度固定为 **32 位数字**。例如设备 ID 为 `123456`，2026-08-18 当天前 3 条告警分别是：
+然后在这个新目录执行：
+
+```bash
+mvn clean test package
+```
+
+本版本额外增加了两层兼容保护：`WindowRange` 恢复旧 `toDorisFilter(...)` 方法用于编译兼容，同时 `pom.xml` 明确排除遗留 `DorisPollingAlertSource.java`。详细说明见 `docs/CLEAN_BUILD_CN.md`。
+
+## 1. 关键结论
+
+### 1.1 不再依赖 Doris
+
+工程已移除 `DorisPollingAlertSource` 和 MySQL Connector 依赖。输入字段直接来自 `METRIC-ENDPOINT` JSON。
+
+算法实际使用字段：
+
+- `collectTime`
+- `srcIp`
+- `dstIp`
+- `protocol`
+- `connCount`
+- `c2sPkts`
+- `s2cPkts`
+- `c2sBytes`
+- `s2cBytes`
+
+`connBytesSeries`、`connTimeSeries`、`dayHourTime`、`dayTime` 当前检测算法不使用。
+
+示例：
+
+```json
+{"c2sBytes":100,"c2sPkts":1,"collectTime":"2026-08-24 13:05:00","connBytesSeries":"100","connCount":1,"connTimeSeries":"1787547942","dayHourTime":"2026-08-24 13","dayTime":"2026-08-24","dstIp":"183.93.235.217","protocol":"UNKNOWN","s2cBytes":0,"s2cPkts":0,"srcIp":"1.224.99.3"}
+```
+
+`totalBytes = c2sBytes + s2cBytes`，`totalPkts = c2sPkts + s2cPkts`。
+
+### 1.2 另一个 Flink 程序读取同一 Topic 不会互相抢数据
+
+只要两个作业使用 **不同的 `group.id`**，它们会各自完整消费 `METRIC-ENDPOINT`。
+
+本工程默认：
+
+```properties
+kafka.input.group.id=net-traffic-sentinel-metric-endpoint-v1
+```
+
+不要把它改成另一个 Flink 作业正在使用的 group.id。
+
+如果两个作业误用了同一个 group.id，Kafka 会把 partitions 分给两个作业，它们会互相“分流”，两边都可能拿不到完整数据。
+
+### 1.3 Partition 数不能假设为 1
+
+Kafka Topic 的 partition 数由实际集群/topic 配置决定，不保证是 1。
+
+程序启动时会主动读取 `METRIC-ENDPOINT` 元数据，并打印：
 
 ```text
-20260818123456000000000000000000
-20260818123456000000000000000001
-20260818123456000000000000000002
+KAFKA_INPUT_CONNECTION_OK topic=METRIC-ENDPOINT partitions=N ...
 ```
+
+`kafka.input.source.parallelism=0` 时，会按实际 partition 数自动选择 Source 并行度，并受 `kafka.input.source.parallelism.max` 限制。
+
+异常分析算子仍固定为 1 个并行实例，以保持原来全局 Pair EMA / Context 历史基线的顺序语义。
+
+## 2. Kafka 起始 Offset
 
 配置：
 
 ```properties
-alert.device.id=123456
+kafka.input.start.mode=latest
 ```
 
-生产环境必须把它改成该设备唯一的 **6 位数字 ID**。序号每天从 `0` 开始，日期使用 `business.timezone` 对应的当前系统日期。`DorisPollingAlertSource` 会把“当前日期 + 下一序号”写入 Flink Operator State，和窗口游标、历史基线一起 Checkpoint。
+可选值：
 
-18 位序号理论容量为 `0 ~ 999999999999999999`；即使每天告警接近百亿，容量也远远足够。
+- `latest`：新部署默认值，只消费启动之后的新消息。
+- `earliest`：从 Topic 当前保留范围的最早 offset 开始。
+- `committed`：从该 group.id 已提交 offset 开始；没有提交记录时按 `kafka.input.committed.offset.reset` 处理。
+- `timestamp`：根据 Kafka **消息自身的 record timestamp** 查找起始 offset。
 
-## type=2 anomalyDetail：精简后的对外字段
-
-`anomalyType=2` 的检测算法内部仍然使用 Context P50/P90、高分位、Pair EMA、multiplier 和冷启动学习模式等信息，
-但这些属于算法实现细节，不再全部写入对外告警。
-
-当前对外只保留 8 个字段：
-
-```json
-{
-  "current_bytes": 796306,
-  "current_pkts": 636,
-  "baseline_bytes": 100,
-  "baseline_pkts": 1,
-  "bytes_threshold": 395122.0,
-  "pkts_threshold": 649.0,
-  "extreme_bytes_threshold": 790244.0,
-  "anomaly_reason": "EXTREME_BYTES"
-}
-```
-
-字段含义：
-
-- `current_bytes` / `current_pkts`：当前记录的字节数、包数；
-- `baseline_bytes` / `baseline_pkts`：本次判定采用的参考基线；
-- `bytes_threshold` / `pkts_threshold`：算法计算后的最终普通异常阈值；
-- `extreme_bytes_threshold`：极端大字节流量阈值；
-- `anomaly_reason`：最终告警原因。
-
-`anomaly_reason` 只有两个值：
-
-```text
-BYTES_AND_PKTS  -> bytes 和 pkts 均超过最终异常阈值
-EXTREME_BYTES   -> bytes 超过普通阈值且达到极端大流量阈值，pkts 无需同时超限
-```
-
-不再对外输出 `baseline_source`、`context_*`、`*_multiplier`、`pair_learning_*`、
-`bytes_anomaly/pkts_anomaly/extreme_bytes` 等算法调试字段。修改只影响告警 JSON，**不改变 type=2 的实际判定与历史学习算法**。
-
----
-
-## 2. 项目信息
-
-- Maven artifact：`NetTrafficSentinel`
-- 主类：`cn.ac.iie.topology.NetTrafficSentinel`
-- JAR：`target/NetTrafficSentinel-1.0-SNAPSHOT.jar`
-- YARN Application：`NET-TRAFFIC-ANOMALY`
-- Flink：1.17.2
-- Java：8 / 11
-- Doris：2.1.x
-
----
-
-## 3. 持续运行方式
-
-任务只需要提交一次。
-
-假设：
-
-```text
-系统时间               = 20:00
-Doris MAX(collectTime) = 12:37
-stable.delay           = 60 分钟
-```
-
-程序计算：
-
-```text
-12:37 - 60min = 11:37
-floorTo5min   = 11:35
-```
-
-因此：
-
-```text
-safeWindowEnd = 11:35
-```
-
-程序最多只处理到：
-
-```text
-[11:30, 11:35)
-```
-
-不会去查询：
-
-```text
-[19:55, 20:00)
-```
-
-随着 Doris 数据继续入库：
-
-```text
-MAX=12:42 -> safeEnd=11:40 -> 处理 [11:35,11:40)
-MAX=12:47 -> safeEnd=11:45 -> 处理 [11:40,11:45)
-...
-```
-
----
-
-## 4. 空窗口不再自动跳过
-
-默认：
+`timestamp` 模式示例：
 
 ```properties
-source.empty.window.advance=false
-source.empty.window.retry.seconds=300
+kafka.input.start.mode=timestamp
+kafka.input.start.timestamp=2026-08-24 00:00:00
 ```
 
-如果某个已经被 Watermark 判断为“成熟”的窗口仍然：
+注意：这里匹配的是 Kafka ConsumerRecord 的 timestamp，不是 JSON 中的 `collectTime`。正常生产应确认生产端 Kafka record timestamp 与业务时间的关系。
 
-```text
-rows=0
-```
+Flink 从自己的 checkpoint 恢复时，checkpoint 中的 Kafka offsets 优先于首次启动配置。
 
-程序会：
+## 3. 延迟/乱序处理
 
-```text
-保持 nextWindowStart 不变
-        ↓
-等待 300 秒
-        ↓
-重新检查 Doris Watermark
-        ↓
-重新查询同一个 5 分钟窗口
-```
-
-不会像旧版一样：
-
-```text
-rows=0
-nextCursor += 5分钟
-```
-
-从而把迟到数据永久跳过去。
-
-> 由于没有上游 COMPLETE 批次标记，`MAX(collectTime) - stable.delay` 仍然是工程折中，不可能数学上证明窗口 100% 完整。对于你们每天几十亿条数据的场景，“额外稳定期 + 空窗口不推进”是当前比较稳妥的实现。
-
----
-
-## 5. type=2 新的历史基线
-
-### 5.1 Context History
-
-Context 定义：
-
-```text
-protocol + WORKDAY/WEEKEND + 5分钟时间槽
-```
-
-例如：
-
-```text
-TLS + WORKDAY + 20:20~20:25
-UNKNOWN + WEEKEND + 09:00~09:05
-```
-
-Context Sketch 只保存：
-
-```text
-bytes 分布
-pkts 分布
-```
-
-不保存：
-
-```text
-srcIp
-dstIp
-pairKey
-```
-
-默认保留：
+目前不知道最大延迟，因此工程默认：
 
 ```properties
-history.context.retention.days=7
+kafka.input.max.out.of.orderness.minutes=360
 ```
 
-实现不是“一个永久增长的 t-digest”，而是：
+即允许约 **6 小时** 的事件时间乱序。
+
+业务窗口仍然以 JSON 的 `collectTime` 为准。例如：
 
 ```text
-Context
-  ├─ 2026-08-11 -> t-digest
-  ├─ 2026-08-12 -> t-digest
-  ├─ 2026-08-13 -> t-digest
-  └─ ...
+[13:00:00, 13:05:00)
 ```
 
-检测 8 月 17 日时，只合并之前保留期内的日期桶。
+只有当 Flink Watermark 越过 `13:05:00` 后，窗口才会 `finish()`、生成告警并更新历史基线。
 
-过期时直接删除整个旧日期桶。
-
-### 5.2 防止异常值污染 Context
-
-如果已经存在至少一个历史日期桶，当前窗口更新历史 Context 时，会把极端值截断在上一历史高分位附近：
+如果某条记录到达时，该窗口的 Watermark 已经越过窗口结束时间，这条记录会被认定为 `too-late`，丢弃并计入：
 
 ```text
-historyValue = min(currentValue, historicalHighQuantile)
+kafka-analysis-too-late-rows
 ```
 
-这样一个 100MB/500MB 的异常不会直接把之后的正常历史分位数抬得很高。
-
-### 5.3 Pair History
-
-Pair：
-
-```text
-srcIp + dstIp + protocol
-```
-
-为了节约内存，历史状态不保存完整字符串，而使用稳定的 64 位 hash 作为 key。
-
-Pair 状态保存：
-
-```text
-emaBytes
-emaPkts
-sampleCount
-lastSeenEventTime
-```
-
-默认：
+如果线上发现确实存在超过 6 小时的数据延迟，应提高：
 
 ```properties
-history.pair.ttl.days=7
-history.pair.max.entries=200000
-history.pair.ema.alpha=0.10
-history.pair.min.samples=3
+kafka.input.max.out.of.orderness.minutes=720
 ```
 
-Pair EMA 更新：
+提高该值的代价是：
 
-```text
-newEMA = oldEMA * 0.90 + current * 0.10
-```
+1. 告警更晚输出；
+2. 同时保持更多未闭合窗口；
+3. TaskManager 内存和 checkpoint 体积增加。
 
-### 5.4 哪些 Pair 会进入历史
-
-不会保存全量 Pair。
-
-每个 5 分钟窗口只保留：
+此外配置：
 
 ```properties
-rule.large.candidate.capacity=20000
+kafka.input.watermark.idle.timeout.minutes=2
 ```
 
-条最大流量 Candidate。
+会把长时间完全没有消息的 Source subtask 标记为 idle，避免整个空闲 subtask 拖住全局 Watermark。
 
-只有这些 bounded candidate 才可能更新 Pair EMA。
+这里的 idleness 位于 JSON 解析后的 subtask 层。如果一个 source subtask 同时负责多个 partition，其中一个 partition 空闲、另一个仍持续有数据，则这个 subtask 不会被标成 idle。若线上 partition 间时间进度差异很大，可把 `kafka.input.source.parallelism` 调到实际 partition 数，再结合延迟指标校准 Watermark。
 
-所以 Pair History 的增长有两层保护：
+注意：如果整个 Topic 完全停止产生更晚的事件时间，标准事件时间 Watermark 不会仅因为机器时间流逝自动前进，因此尾部窗口会继续等待，直到后续有更晚事件推动 Watermark。
+
+## 4. 异常 JSON 处理
+
+坏消息不会让整个 Flink 作业失败。
+
+处理规则：
+
+- JSON 无法解析：丢弃；
+- `collectTime` 缺失/无法解析：丢弃；
+- `srcIp` / `dstIp` 缺失或不是可识别的 IPv4/IPv6 形式：丢弃；
+- `protocol` 缺失：按空字符串处理；
+- bytes/pkts/connCount 缺失或 null：按 0；
+- bytes/pkts/connCount 为负数：按 0；
+- 数字字段不是整数：丢弃。
+
+指标：
 
 ```text
-每窗口 Candidate 上限 20000
-            +
-全局 Pair State 上限 200000
-            +
-7 天事件时间 TTL
+kafka-input-good-json-rows
+kafka-input-bad-json-rows
 ```
 
-### 5.5 异常 Pair 的受限学习
+日志只对最初少量坏消息和每 10000 条坏消息抽样输出，避免日志风暴。
 
-为了避免新 Pair 第一次就触发 type=2 后永远无法积累 Pair EMA，当前逻辑区分冷启动和成熟 Pair：
+## 5. 启动时 Kafka 权限检查
 
-```text
-Pair samples < history.pair.min.samples
-    + 当前触发 type=2
-    -> 允许学习，但 bytes/pkts 分别 cap 到有效 Context 的高分位阈值
-
-Pair samples >= history.pair.min.samples
-    + 当前触发 type=2
-    -> 不更新 Pair EMA
-```
-
-默认开关：
+默认开启：
 
 ```properties
-history.pair.bootstrap.anomaly.capped.learning.enabled=true
+kafka.input.connection.check.enabled=true
+kafka.input.connection.fail-fast=true
 ```
 
-这样既能让冷启动 Pair 逐步获得自己的 EMA，又继续阻止成熟 Pair 直接吸收异常大值。
+启动前会：
 
-### 5.6 baseline_bytes 的含义
+1. 连接 Kafka broker；
+2. 查询 `METRIC-ENDPOINT` topic 元数据；
+3. 读取实际 partition 数；
+4. 使用配置的真实 group.id 做 OffsetFetch 权限检查，但不加入/rebalance consumer group；
+5. 对一个 partition 做手工 assign + 极小 fetch，触发 Topic READ 权限校验；
+6. 不提交 offset。
 
-优先级：
+检查失败时默认直接终止启动，避免作业“跑起来但一直读不到数据”。
 
-```text
-Pair bounded samples >= 3
-    -> baseline = Pair EMA
+输出端仍保留原来的 Kafka metadata/Producer delivery 监控。
 
-否则 Context 历史已经成熟
-    -> baseline = Historical Context P50
+## 6. Checkpoint 与旧基线
 
-否则（冷启动）
-    -> baseline = 当前 5 分钟 Context P50
-```
+本 Kafka 版本按你的要求 **不继承旧 Doris 作业的历史基线**。
 
-因此新 Pair 的 `baseline_bytes` 仍然可能比较小，这是因为它没有自身历史，只能退化到同协议/同时段的中位数。
-
-但是最终告警阈值不会只用 baseline：
-
-```text
-bytesThreshold = max(
-    Historical Context P99.9,
-    baselineBytes * 4
-)
-```
-
-因此 `baseline=200` 并不意味着 801 Bytes 就会报警。
-
----
-
-## 6. type=2 判断公式
-
-默认：
-
-```text
-bytesQ = 0.999
-pktsQ  = 0.999
-baselineMultiplier = 4
-extremeMultiplier  = 2
-```
-
-判断：
-
-```text
-currentBytes > max(contextP99.9Bytes, baselineBytes * 4)
-AND
-(
-    currentPkts > max(contextP99.9Pkts, baselinePkts * 4)
-    OR
-    currentBytes > contextP99.9Bytes * 2
-)
-```
-
-同一个 Pair 在同一 5 分钟窗口最多输出一条 type=2 告警，选择最大 currentBytes 的那条。
-
----
-
-## 7. type=3 非工作时段 TopN
-
-非工作时间：
-
-```text
-周一~周五：20:00~24:00 + 00:00~08:00
-周六/周日：全天
-```
-
-每个 5 分钟窗口：
-
-```text
-item   = srcIp|dstIp|protocol
-weight = connCount
-```
-
-使用固定容量 Weighted Space-Saving：
+首次启动请使用新的 checkpoint 路径：
 
 ```properties
-rule.offhours.topn=100
-rule.offhours.sketch.capacity=2048
+checkpoint.storage.path=hdfs:///flink-checkpoints/net-traffic-sentinel-kafka
 ```
 
-输出近似 Top100。
+不要使用旧 Doris 作业 checkpoint/savepoint 恢复本版本。
 
----
+新版本 checkpoint 保存：
 
-## 8. Checkpoint 中保存什么
+- KafkaSource offsets；
+- 等待迟到数据的未闭合 5 分钟窗口摘要；
+- Context 历史 t-digest；
+- Pair EMA；
+- logId 日内序号；
+- Flink event-time timers。
 
-新版 checkpoint/savepoint 不只保存 cursor，还保存：
+因此**本 Kafka 版本自身**发生故障后可以继续从自己的 checkpoint 恢复。
 
-```text
-nextWindowStart
-Context 历史日期桶
-Pair EMA 历史
-```
+## 7. 主要配置
 
-窗口查询过程中不修改长期状态。
-
-只有完整查询 + 完整检测成功以后，在 checkpoint 临界区一次性执行：
-
-```text
-1. emit alerts
-2. apply Context History update
-3. apply Pair EMA update
-4. nextWindowStart += 5分钟
-```
-
-如果 JDBC 查询中途失败，以上四件事都不会发生。
-
----
-
-## 8.1 Doris 大数据量读取降压
-
-`metric_endpoint` 当前按 `dayHourTime` 小时分区，并且 `dayHourTime` 在分区内是整点值。Source 因此使用：
-
-```sql
-WHERE dayTime = '2026-08-21'
-  AND dayHourTime = '2026-08-21 10:00:00'
-  AND collectTime >= '2026-08-21 10:00:00'
-  AND collectTime <  '2026-08-21 10:01:00'
-```
-
-而不是对 `dayHourTime` 做一小时范围过滤。这样更贴合 `(dayTime, dayHourTime, collectTime)` 的排序键前缀。
-
-为了避免单条 5 分钟 SQL 一次返回约 700~800 万行，业务窗口仍保持 5 分钟，但 JDBC 默认按 60 秒切成 5 条 SQL；所有切片共享同一个 `FiveMinuteWindowAnalyzer`，最后只 `finish()` 一次，因此告警算法语义不变。默认配置：
+输入：
 
 ```properties
-source.doris.query.slice.seconds=60
-source.doris.slice.pause.millis=1000
-source.catchup.pause.seconds=5
-
-doris.query.resource.limit.enabled=true
-doris.query.parallelism=1
-doris.query.scanner.threads=1
+kafka.input.topic=METRIC-ENDPOINT
+kafka.input.group.id=net-traffic-sentinel-metric-endpoint-v1
+kafka.input.start.mode=latest
+kafka.input.max.out.of.orderness.minutes=360
+kafka.input.source.parallelism=0
+kafka.input.source.parallelism.max=4
 ```
 
-`parallel_pipeline_task_num` 和 `num_scanner_threads` 通过 JDBC Session 的 `SET` 设置，只影响本 Source 建立的 Doris 连接，不修改集群全局变量。若 60 秒切片仍对共享 Doris 造成明显压力，可先把 `source.doris.query.slice.seconds` 调成 `30`，而不是使用 `LIMIT/OFFSET`。
-
-查询字段也由 9 列降为 7 列：Doris 侧直接计算 `totalPkts` / `totalBytes`，减少 JDBC 返回结果和 Flink 解析开销。每个切片都会记录实际 `rows` 和 `elapsedMs`，上线后可以据此决定切片大小。
-
-## 9. 强烈建议配置 HDFS checkpoint
-
-不要长期使用日志中的：
-
-```text
-Checkpoint storage is set to 'jobmanager'
-```
-
-生产配置：
+输出：
 
 ```properties
-checkpoint.storage.path=hdfs:///flink-checkpoints/net-traffic-sentinel
+kafka.output.topic=anomaly_alert
+kafka.output.delivery.guarantee=at_least_once
 ```
 
-默认 checkpoint 周期已经调整为：
+输入、输出共用：
 
 ```properties
-checkpoint.interval.ms=300000
+kafka.bootstrap.servers=...
+kafka.security.protocol=SASL_PLAINTEXT
+kafka.sasl.mechanism=GSSAPI
+kafka.sasl.kerberos.service.name=kafka
 ```
 
-即 5 分钟一次，因为新版 checkpoint 中包含历史基线状态，没必要每分钟完整 snapshot 一次。
+## 8. 构建
 
----
+环境：
 
-## 10. 编译
+- Java 8/11
+- Maven
+- Flink 1.17.2
+
+构建：
 
 ```bash
-cd NetTrafficSentinel
-mvn clean package
+./build.sh
+```
+
+或：
+
+```bash
+mvn clean test package
+```
+
+Windows 也可以执行：
+
+```bat
+build.bat
 ```
 
 产物：
@@ -541,284 +299,41 @@ mvn clean package
 target/NetTrafficSentinel-1.0-SNAPSHOT.jar
 ```
 
----
+## 9. YARN 运行
 
-## 11. YARN 提交
+确认外置 `application.properties` 后：
 
 ```bash
 ./run-yarn.sh
 ```
 
-等价命令：
-
-```bash
-/home/xgs/flink-1.17.2/bin/flink run-application \
-  -t yarn-application \
-  -ys 1 \
-  -p 1 \
-  -Dlog4j.debug=true \
-  -Denv.java.opts=-Duser.timezone=Asia/Shanghai \
-  -Djobmanager.memory.process.size=8048m \
-  -Dtaskmanager.memory.process.size=10240m \
-  -Dtaskmanager.memory.managed.size=2048m \
-  -Dyarn.application.name=NET-TRAFFIC-ANOMALY \
-  -Dyarn.ship-files=/absolute/path/application.properties \
-  -c cn.ac.iie.topology.NetTrafficSentinel \
-  target/NetTrafficSentinel-1.0-SNAPSHOT.jar \
-  --config application.properties
-```
-
----
-
-## 12. 第一次上线怎么选 source.start.mode
-
-### 只想从 Doris 当前成熟位置开始
-
-```properties
-source.start.mode=latest_data
-```
-
-这时历史 Context 属于冷启动，需要积累至少：
-
-```properties
-history.context.min.days=2
-```
-
-个历史日期后才使用跨日 Context P99.9。
-
-### 想从某个历史时间补算
-
-```properties
-source.start.mode=fixed
-source.start.time=2026-08-15 00:00:00
-```
-
-程序会从这个窗口开始，一直追到当前 Doris safe watermark，然后继续常驻。
-
-注意：历史补算期间也会产生告警。如果不想把补历史的告警发送 Kafka，建议先：
-
-```properties
-alert.output.log.enabled=true
-alert.output.kafka.enabled=false
-
-# Kafka 使用 SASL_PLAINTEXT + Kerberos/GSSAPI 时：
-kafka.security.protocol=SASL_PLAINTEXT
-kafka.sasl.kerberos.service.name=kafka
-kafka.sasl.mechanism=GSSAPI
-```
-
-等追上以后再启 Kafka。
-
----
-
-## 13. 重要升级提示
-
-如果旧版本已经把 cursor 推进到了“系统当前时间附近”，但 Doris 实际数据只到上午，那么旧 cursor 中间可能已经跳过迟到数据。
-
-**升级到本版本时，不建议直接把旧版本 cursor 当成可信进度。**
-
-建议：
-
-1. 新建 YARN Application；
-2. 根据 Doris 实际数据范围选择 `source.start.mode=fixed`；
-3. 从一个确认安全的历史时间重新补算；
-4. 等追上新的 Doris Watermark 后继续常驻。
-
----
-
-## 14. 推荐重点观察的日志
-
-### Doris Watermark
+重点检查启动日志：
 
 ```text
-Doris data watermark updated:
-maxCollectTime=2026-08-17 12:37:00,
-stableDelay=60m,
-safeWindowEnd=2026-08-17 11:35:00
+KAFKA_INPUT_CONNECTION_OK
+Creating Kafka input source
+KAFKA_WINDOW_OPEN
+KAFKA_WINDOW_FINALIZED
 ```
 
-### 开始窗口与切片
+如果长时间只有 `KAFKA_WINDOW_OPEN` 而没有 `KAFKA_WINDOW_FINALIZED`，优先检查：
 
-```text
-Start Doris window query: window=[2026-08-17 11:30:00, 2026-08-17 11:35:00), sliceSeconds=60 ...
-Start Doris slice query: window=[2026-08-17 11:30:00, 2026-08-17 11:35:00), slice=[2026-08-17 11:30:00, 2026-08-17 11:31:00) ...
-Doris slice completed: ... rows=1500000, elapsedMs=...
-```
+1. `collectTime` 是否持续向前推进；
+2. `kafka.input.max.out.of.orderness.minutes` 是否过大；
+3. 是否有 partition/subtask 长期不活跃且 idleness 未生效；
+4. Kafka 数据是否已经停止产生。
 
-这里的 `rows` 和 `elapsedMs` 是调节 `source.doris.query.slice.seconds` 的主要依据。
-
-### 窗口完成
-
-```text
-Window finished:
-rows=...
-alerts=...
-pairHistoryEntries=...
-contextHistoryBuckets=...
-nextCursor=...
-```
-
-### 空窗口
-
-```text
-Empty Doris window ... Cursor is NOT advanced
-```
-
-如果大量出现这一行，应考虑：
-
-```properties
-source.doris.stable.delay.minutes
-```
-
-是否仍然太小。
-
----
-
-### Kafka 连接、5 分钟汇总与发送结果
-
-当：
-
-```properties
-alert.output.kafka.enabled=true
-```
-
-建议同时保持：
-
-```properties
-kafka.monitor.connection.check.enabled=true
-kafka.monitor.connection.timeout.ms=10000
-kafka.monitor.connection.fail-fast=false
-kafka.monitor.delivery.log.enabled=true
-kafka.monitor.delivery.summary.interval.ms=300000
-kafka.monitor.delivery.per-record.log.enabled=false
-kafka.client.id=net-traffic-sentinel-alert
-```
-
-TaskManager 启动 Kafka 输出分支时先检查集群连通性，再单独检查 topic 元数据：
-
-```text
-KAFKA_CONNECTION_CHECK_START ...
-KAFKA_CONNECTION_OK bootstrapServers=... clusterId=... brokerCount=5 ...
-KAFKA_TOPIC_METADATA_OK topic=anomaly_alert partitions=1 ...
-```
-
-如果集群连接已经成功，但启动瞬间 topic 元数据暂时没有准备好，会记录 WARN，而不再误报成 Kafka 整体连接失败：
-
-```text
-KAFKA_TOPIC_METADATA_NOT_READY topic=anomaly_alert ...
-```
-
-真正的网络/SASL/Kerberos/集群元数据连接失败才记录：
-
-```text
-KAFKA_CONNECTION_FAILED bootstrapServers=... errorType=... errorMessage=...
-```
-
-业务检测侧，每处理完一个 Doris 5 分钟窗口会输出一条汇总：
-
-```text
-ALERT_WINDOW_SUMMARY window=[2026-08-18 20:35:00,2026-08-18 20:40:00) rows=... totalAlerts=14830 anomalyTypeKinds=2 anomalyTypeCounts={2=14730, 3=100} ...
-```
-
-其中 `totalAlerts` 是该业务 5 分钟窗口产生的告警总数，`anomalyTypeCounts` 是各异常类型的精确数量。
-
-Kafka Producer 默认不再打印每条 `KAFKA_SEND_ATTEMPT` / `KAFKA_SEND_SUCCESS`。发送统计按 5 分钟聚合输出：
-
-```text
-KAFKA_DELIVERY_SUMMARY clientId=net-traffic-sentinel-alert intervalStart=2026-08-18 20:40:00 intervalEnd=2026-08-18 20:45:00 intervalMs=300000 attemptedRecords=14830 successfulRecords=14830 failedRecords=0 attemptedBytes=6379839 successBytes=6379839 avgSuccessBytes=430 inFlight=0 totalAttemptedRecords=14830 totalSuccessfulRecords=14830 totalFailedRecords=0
-```
-
-第一次收到真实 broker ACK 时仍会额外记录一次：
-
-```text
-KAFKA_WRITE_VERIFIED ... message=First broker acknowledgement received; Kafka connection/auth/topic write path is working
-```
-
-最终发送失败会在当前 5 分钟传输区间内立即记录第一条 ERROR，其余失败只累计到汇总，避免 Kafka 故障时 ERROR 再次刷屏：
-
-```text
-KAFKA_SEND_FAILED clientId=... failedRecords=1 successRecords=... attemptedRecords=... errorType=... errorMessage=... message=First send failure in current summary interval; remaining failures are aggregated
-```
-
-如果临时排障确实需要恢复逐条 Kafka 日志，可以设置：
-
-```properties
-kafka.monitor.delivery.per-record.log.enabled=true
-```
-
-注意：`ALERT_WINDOW_SUMMARY` 是 Doris 的**业务 5 分钟检测窗口**；`KAFKA_DELIVERY_SUMMARY` 是 Producer 的**传输时间 5 分钟汇总**。由于 Kafka ACK 是异步返回的，这两条日志不能强行假设为逐条一一对应，但前者能精确看异常类型分布，后者能精确看 ACK 成功/失败和发送字节数。
-
-如果 `alert.output.log.enabled=true`，`LocalLogSink` 仍会逐条打印 `ANOMALY_ALERT`。只希望保留窗口汇总和 Kafka 汇总时，可设置：
-
-```properties
-alert.output.log.enabled=false
-```
-
-如果使用 `kafka.delivery.guarantee=exactly_once`，Kafka ACK 成功表示 record 已被 Producer/broker 接收；事务最终提交和 `read_committed` consumer 可见性仍以 Flink checkpoint 成功为准。
-
----
-
-## 15. 目录
+## 10. 目录
 
 ```text
 src/main/java/cn/ac/iie/topology/NetTrafficSentinel.java
-    Flink 作业入口
-
-src/main/java/cn/ac/iie/anomaly/source/DorisPollingAlertSource.java
-    Doris Watermark、5 分钟轮询、JDBC streaming、checkpoint state
-
-src/main/java/cn/ac/iie/anomaly/history/HistoricalBaselineStore.java
-    7 天 Context 时间桶 + Pair EMA + TTL/容量淘汰 + checkpoint snapshot
-
-src/main/java/cn/ac/iie/anomaly/history/ContextKey.java
-    protocol + 工作日类型 + 时间槽
-
-src/main/java/cn/ac/iie/anomaly/rule/FiveMinuteWindowAnalyzer.java
-    单个 5 分钟窗口统一分析
-
-src/main/java/cn/ac/iie/anomaly/rule/LargeTrafficAccumulator.java
-    当前窗口 Context t-digest + 固定 Candidate Heap
-
-src/main/java/cn/ac/iie/anomaly/rule/LargeTrafficDetector.java
-    type=2 历史阈值/Pair EMA 判断
-
-src/main/java/cn/ac/iie/anomaly/rule/OffHoursDetector.java
-    type=3 TopN
+src/main/java/cn/ac/iie/anomaly/source/KafkaSourceFactory.java
+src/main/java/cn/ac/iie/anomaly/source/KafkaInputConnectivityCheck.java
+src/main/java/cn/ac/iie/anomaly/source/MetricJsonParser.java
+src/main/java/cn/ac/iie/anomaly/source/KafkaWindowAlertProcessFunction.java
+src/main/java/cn/ac/iie/anomaly/rule/*
+src/main/java/cn/ac/iie/anomaly/history/*
+src/main/java/cn/ac/iie/anomaly/sink/*
 ```
 
-更详细部署与排错请看：
-
-```text
-docs/BEGINNER_DEPLOYMENT_GUIDE_CN.md
-```
-
----
-
-## 12. 从上一版升级到 V2
-
-V2 的 Source Operator State 已经发生变化：除了 5 分钟 cursor，还新增了 Context t-digest 历史桶和 Pair EMA 历史状态，并使用新的 `*-v2` state name / operator UID。
-
-因此第一次升级建议：
-
-1. 停止旧版 YARN Application；
-2. **不要直接使用旧版 checkpoint 强行恢复 V2**；
-3. 根据 Doris 当前数据进度选择一个确认安全的历史 5 分钟边界；
-4. 第一次启动时配置：
-
-```properties
-source.start.mode=fixed
-source.start.time=2026-08-15 20:00:00
-```
-
-5. 让 V2 从该时间开始补跑；追到 `safeWindowEnd` 后会自动进入等待状态并持续运行；
-6. V2 自己产生 checkpoint/savepoint 后，后续再用 V2 状态恢复。
-
-如果不需要补历史，也可以保持：
-
-```properties
-source.start.mode=latest_data
-```
-
-此时首次启动会从 Doris 当前安全 Watermark 前一个完整 5 分钟窗口开始。
-
-> 根目录 `application.properties` 是部署用外置配置，当前保留了你提供的 Doris 连接信息；`src/main/resources/application.properties` 中密码仍是 `CHANGE_ME_DORIS_PASSWORD`。请不要把真实密码版本提交到公共代码仓库，部署服务器上建议限制配置文件读取权限。
+原 Doris 版长文档被保留在 `docs/legacy-doris/`，仅用于历史参考，不适用于当前运行链路。

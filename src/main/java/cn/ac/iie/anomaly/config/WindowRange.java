@@ -6,10 +6,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 
-/**
- * 业务 5 分钟窗口，采用左闭右开 [start, end)。
- * 例如 [00:00, 00:05) 包含 00:04:59，但不包含 00:05:00，避免相邻窗口重复统计。
- */
+/** Business-time window using left-closed/right-open semantics: [start, end). */
 public final class WindowRange implements Serializable {
     private static final long serialVersionUID = 1L;
     public static final DateTimeFormatter DATETIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
@@ -20,6 +17,9 @@ public final class WindowRange implements Serializable {
     private final ZoneId zoneId;
 
     public WindowRange(LocalDateTime start, LocalDateTime end, ZoneId zoneId) {
+        if (start == null || end == null || zoneId == null) {
+            throw new IllegalArgumentException("window start/end/zoneId must not be null");
+        }
         if (!end.isAfter(start)) {
             throw new IllegalArgumentException("window end must be after start");
         }
@@ -48,18 +48,18 @@ public final class WindowRange implements Serializable {
     }
 
     /**
-     * Doris predicates deliberately include all three sort/partition time columns.
-     *
-     * metric_endpoint stores dayHourTime as the exact hour boundary (for example 10:00:00 for
-     * every row in partition pYYYYMMDD10).  Using equality on dayTime/dayHourTime and a range on
-     * collectTime matches the table sort-key prefix (dayTime, dayHourTime, collectTime) better than
-     * using a broad one-hour range on dayHourTime.
+     * Backward-compatible helper kept only so an old Doris source accidentally left in an
+     * overlaid checkout does not break compilation. The Kafka topology never calls this method.
      */
+    @Deprecated
     public String toDorisFilter() {
         return toDorisFilter(start, end);
     }
 
-    /** Builds the same optimized Doris predicate for a sub-range inside this business window. */
+    /**
+     * Backward-compatible Doris predicate helper. New Kafka code does not depend on Doris.
+     */
+    @Deprecated
     public String toDorisFilter(LocalDateTime queryStart, LocalDateTime queryEnd) {
         if (queryStart == null || queryEnd == null || !queryEnd.isAfter(queryStart)) {
             throw new IllegalArgumentException("queryEnd must be after queryStart");

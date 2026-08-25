@@ -48,14 +48,14 @@ public final class KafkaConnectivityProbe extends RichMapFunction<String, String
         }
 
         String bootstrapServers = config.get("kafka.bootstrap.servers", "localhost:9092");
-        String topic = config.get("kafka.topic", "anomaly_alert");
+        String topic = config.get("kafka.output.topic", config.get("kafka.topic", "anomaly_alert"));
         long timeoutMs = config.getLong("kafka.monitor.connection.timeout.ms", 10000L);
         boolean failFast = config.getBoolean("kafka.monitor.connection.fail-fast", false);
 
         Properties properties = KafkaSinkFactory.buildSecurityProperties(config);
         properties.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         properties.put(AdminClientConfig.CLIENT_ID_CONFIG,
-                config.get("kafka.client.id", "net-traffic-sentinel-alert") + "-probe");
+                config.get("kafka.output.client.id", config.get("kafka.client.id", "net-traffic-sentinel-alert")) + "-probe");
         properties.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, String.valueOf(timeoutMs));
         properties.put(AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, String.valueOf(timeoutMs));
 

@@ -1,16 +1,26 @@
 package cn.ac.iie.topology;
 
 import cn.ac.iie.anomaly.config.AppConfig;
+import cn.ac.iie.anomaly.config.WindowRange;
 import cn.ac.iie.anomaly.model.AlertRecord;
+import cn.ac.iie.anomaly.model.MetricRecord;
 import cn.ac.iie.anomaly.sink.AlertJsonMapper;
 import cn.ac.iie.anomaly.sink.KafkaConnectivityProbe;
 import cn.ac.iie.anomaly.sink.KafkaSinkFactory;
 import cn.ac.iie.anomaly.sink.LocalLogSink;
 import cn.ac.iie.anomaly.sink.NoOpStringSink;
-import cn.ac.iie.anomaly.source.DorisPollingAlertSource;
+import cn.ac.iie.anomaly.source.KafkaInputConnectivityCheck;
+import cn.ac.iie.anomaly.source.KafkaSourceFactory;
+import cn.ac.iie.anomaly.source.KafkaWindowAlertProcessFunction;
+import cn.ac.iie.anomaly.source.MetricJsonParser;
+import cn.ac.iie.anomaly.util.TimeUtils;
 import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.api.common.eventtime.SerializableTimestampAssigner;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.api.common.time.Time;
+import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
@@ -19,47 +29,44 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
+import java.time.ZoneId;
+import java.util.Locale;
+
 /**
- * 【导读：程序总入口】
+ * NetTrafficSentinel Kafka edition.
  *
- * 这个类可以理解成整个 Flink 作业的“main 方法 + 流水线装配图”。
- * 它本身不负责异常算法，主要做 5 件事：
- * 1. 读取 application.properties；
- * 2. 创建 Flink StreamExecutionEnvironment；
- * 3. 配置重启和 Checkpoint；
- * 4. 把 DorisPollingAlertSource 接到 JSON 转换，再接日志/Kafka Sink；
- * 5. 调用 env.execute() 真正提交并启动作业。
- *
- * 建议初学者先读这个类，建立“Source -> Map -> Sink”的整体印象，
- * 再进入 DorisPollingAlertSource 看数据是如何一批一批被读出来的。
+ * Pipeline:
+ * Kafka(METRIC-ENDPOINT JSON) -> normalize/validate -> collectTime event-time + watermark
+ * -> ordered 5-minute anomaly analyzer -> JSON -> log/Kafka(anomaly_alert).
  */
 public class NetTrafficSentinel {
     private static final Logger LOG = LoggerFactory.getLogger(NetTrafficSentinel.class);
 
     public static void main(String[] args) throws Exception {
-        // 第一步：加载配置。支持 --config=xxx.properties，也支持项目根目录 application.properties。
         AppConfig config = AppConfig.load(args);
-        // 在真正启动 Flink 之前先做参数合法性校验，尽早发现错误配置。
         validateConfig(config);
 
-        LOG.info("Starting NetTrafficSentinel: jobName={}, table={}, window={}m, timezone={}, logSink={}, kafkaSink={}",
+        // Preflight before submitting the streaming graph. It discovers the actual partition count and
+        // verifies broker/topic/read/group access without committing any consumer offset.
+        int discoveredPartitions = KafkaInputConnectivityCheck.verify(config);
+        int sourceParallelism = resolveSourceParallelism(config, discoveredPartitions);
+
+        LOG.info("Starting NetTrafficSentinel Kafka edition: jobName={}, inputTopic={}, inputGroupId={}, "
+                        + "inputStartMode={}, discoveredPartitions={}, sourceParallelism={}, window={}m, "
+                        + "maxOutOfOrderness={}m, timezone={}, logSink={}, kafkaSink={}",
                 config.get("job.name", "NET-TRAFFIC-ANOMALY"),
-                config.get("doris.table"),
+                config.get("kafka.input.topic", "METRIC-ENDPOINT"),
+                config.get("kafka.input.group.id", "net-traffic-sentinel-metric-endpoint-v1"),
+                config.get("kafka.input.start.mode", "latest"),
+                discoveredPartitions,
+                sourceParallelism,
                 config.getInt("window.size.minutes", 5),
+                config.getLong("kafka.input.max.out.of.orderness.minutes", 360L),
                 config.get("business.timezone", "Asia/Shanghai"),
-                config.getBoolean("alert.output.log.enabled", true),
-                config.getBoolean("alert.output.kafka.enabled", false));
+                config.getBoolean("alert.output.log.enabled", false),
+                config.getBoolean("alert.output.kafka.enabled", true));
 
-        if (config.getBoolean("alert.output.kafka.enabled", false)) {
-            LOG.info("Kafka output enabled: bootstrapServers={}, topic={}, securityProtocol={}, saslMechanism={}, kerberosServiceName={}",
-                    config.get("kafka.bootstrap.servers", "localhost:9092"),
-                    config.get("kafka.topic", "anomaly_alert"),
-                    config.get("kafka.security.protocol", "SASL_PLAINTEXT"),
-                    config.get("kafka.sasl.mechanism", "GSSAPI"),
-                    config.get("kafka.sasl.kerberos.service.name", "kafka"));
-        }
-
-        // Flink 的执行环境。可以把它理解成“搭建整条 DataStream 流水线的工作台”。
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
         env.setRestartStrategy(RestartStrategies.fixedDelayRestart(
@@ -67,53 +74,104 @@ public class NetTrafficSentinel {
                 Time.seconds(config.getLong("restart.delay.seconds", 10L))));
         configureCheckpointing(env, config);
 
-        // Source：持续轮询 Doris。注意：本项目不是直接使用 Flink SQL Window，
-        // 而是在 Source 内部手工按 5 分钟范围查询 Doris，并输出已经判定好的 AlertRecord。
-        DataStreamSource<AlertRecord> alerts = env.addSource(new DorisPollingAlertSource(config));
-        alerts.name("doris-five-minute-polling-source");
-        alerts.uid("doris-five-minute-polling-source-v2");
-        alerts.setParallelism(config.getInt("source.parallelism", 1));
+        KafkaSource<String> kafkaSource = KafkaSourceFactory.create(config);
+        DataStreamSource<String> rawJson = env.fromSource(
+                kafkaSource,
+                WatermarkStrategy.noWatermarks(),
+                "metric-endpoint-kafka-source");
+        rawJson.setParallelism(sourceParallelism);
+        rawJson.uid("metric-endpoint-kafka-source-v1");
 
-        // Map：把 Java 告警对象序列化成 JSON 字符串，方便写日志或 Kafka。
+        SingleOutputStreamOperator<MetricRecord> metrics = rawJson
+                .flatMap(new MetricJsonParser(config))
+                .name("metric-json-normalizer")
+                .uid("metric-json-normalizer-v1")
+                .setParallelism(sourceParallelism);
+
+        long maxOutOfOrdernessMinutes = config.getLong("kafka.input.max.out.of.orderness.minutes", 360L);
+        long idleTimeoutMinutes = config.getLong("kafka.input.watermark.idle.timeout.minutes", 2L);
+        WatermarkStrategy<MetricRecord> watermarkStrategy = WatermarkStrategy
+                .<MetricRecord>forBoundedOutOfOrderness(Duration.ofMinutes(maxOutOfOrdernessMinutes))
+                .withTimestampAssigner(new SerializableTimestampAssigner<MetricRecord>() {
+                    private static final long serialVersionUID = 1L;
+                    @Override
+                    public long extractTimestamp(MetricRecord element, long recordTimestamp) {
+                        return element.getCollectTimestamp();
+                    }
+                });
+        if (idleTimeoutMinutes > 0L) {
+            watermarkStrategy = watermarkStrategy.withIdleness(Duration.ofMinutes(idleTimeoutMinutes));
+        }
+
+        SingleOutputStreamOperator<MetricRecord> eventTimeMetrics = metrics
+                .assignTimestampsAndWatermarks(watermarkStrategy)
+                .name("collect-time-watermarks")
+                .uid("collect-time-watermarks-v1")
+                .setParallelism(sourceParallelism);
+
+        // Global historical Pair EMA/context state intentionally stays single-parallelism to retain the
+        // ordered semantics of the old Doris source. KafkaSource/parsing may still be parallel.
+        SingleOutputStreamOperator<AlertRecord> alerts = eventTimeMetrics
+                .keyBy(new KeySelector<MetricRecord, Integer>() {
+                    private static final long serialVersionUID = 1L;
+                    @Override
+                    public Integer getKey(MetricRecord value) {
+                        return 0;
+                    }
+                })
+                .process(new KafkaWindowAlertProcessFunction(config))
+                .name("five-minute-kafka-anomaly-analyzer")
+                .uid("five-minute-kafka-anomaly-analyzer-v1")
+                .setParallelism(1);
+
         SingleOutputStreamOperator<String> jsonAlerts = alerts
                 .map(new AlertJsonMapper())
                 .name("alert-to-json")
-                .uid("alert-to-json-v2");
+                .uid("alert-to-json-v3")
+                .setParallelism(1);
 
         boolean logEnabled = config.getBoolean("alert.output.log.enabled", false);
-        boolean kafkaEnabled = config.getBoolean("alert.output.kafka.enabled", false);
+        boolean kafkaEnabled = config.getBoolean("alert.output.kafka.enabled", true);
         if (logEnabled) {
-            jsonAlerts.addSink(new LocalLogSink()).name("alert-local-log").uid("alert-local-log-v2");
+            jsonAlerts.addSink(new LocalLogSink()).name("alert-local-log").uid("alert-local-log-v3");
         }
         if (kafkaEnabled) {
             SingleOutputStreamOperator<String> kafkaAlerts = jsonAlerts
                     .map(new KafkaConnectivityProbe(config))
-                    .name("kafka-connectivity-probe")
-                    .uid("kafka-connectivity-probe-v1");
-            kafkaAlerts.sinkTo(KafkaSinkFactory.create(config)).name("alert-kafka").uid("alert-kafka-v2");
+                    .name("kafka-output-connectivity-probe")
+                    .uid("kafka-output-connectivity-probe-v2");
+            kafkaAlerts.sinkTo(KafkaSinkFactory.create(config))
+                    .name("alert-kafka")
+                    .uid("alert-kafka-v3");
         }
         if (!logEnabled && !kafkaEnabled) {
-            jsonAlerts.addSink(new NoOpStringSink()).name("alert-noop").uid("alert-noop-v2");
+            jsonAlerts.addSink(new NoOpStringSink()).name("alert-noop").uid("alert-noop-v3");
         }
 
-        // execute() 之前，上面的代码只是在“描述”作业拓扑；调用 execute() 后才真正提交执行。
         env.execute(config.get("job.name", "NET-TRAFFIC-ANOMALY"));
     }
 
-    /**
-     * 配置 Flink Checkpoint。
-     *
-     * 可以先记住：Checkpoint 就是 Flink 定期给“游标 + 历史基线”拍快照。
-     * 任务失败重启后，initializeState() 会从最近一次成功快照恢复，避免从头学习基线。
-     */
+    private static int resolveSourceParallelism(AppConfig config, int discoveredPartitions) {
+        int configured = config.getInt("kafka.input.source.parallelism", 0);
+        if (configured > 0) {
+            return configured;
+        }
+        int maxAuto = Math.max(1, config.getInt("kafka.input.source.parallelism.max", 4));
+        if (discoveredPartitions > 0) {
+            return Math.max(1, Math.min(discoveredPartitions, maxAuto));
+        }
+        return 1;
+    }
+
     private static void configureCheckpointing(StreamExecutionEnvironment env, AppConfig config) {
         boolean checkpointEnabled = config.getBoolean("checkpoint.enabled", true);
-        String delivery = config.get("kafka.delivery.guarantee", "at_least_once");
-        boolean kafkaEnabled = config.getBoolean("alert.output.kafka.enabled", false);
+        String delivery = config.get("kafka.output.delivery.guarantee",
+                config.get("kafka.delivery.guarantee", "at_least_once"));
+        boolean kafkaEnabled = config.getBoolean("alert.output.kafka.enabled", true);
         if (kafkaEnabled
                 && ("exactly_once".equalsIgnoreCase(delivery) || "at_least_once".equalsIgnoreCase(delivery))
                 && !checkpointEnabled) {
-            throw new IllegalArgumentException("Kafka " + delivery + " requires checkpoint.enabled=true");
+            throw new IllegalArgumentException("Kafka output " + delivery + " requires checkpoint.enabled=true");
         }
         if (!checkpointEnabled) {
             return;
@@ -121,7 +179,7 @@ public class NetTrafficSentinel {
 
         env.enableCheckpointing(config.getLong("checkpoint.interval.ms", 300000L), CheckpointingMode.EXACTLY_ONCE);
         CheckpointConfig checkpointConfig = env.getCheckpointConfig();
-        checkpointConfig.setCheckpointTimeout(config.getLong("checkpoint.timeout.ms", 600000L));
+        checkpointConfig.setCheckpointTimeout(config.getLong("checkpoint.timeout.ms", 900000L));
         checkpointConfig.setMinPauseBetweenCheckpoints(config.getLong("checkpoint.min.pause.ms", 30000L));
         checkpointConfig.setMaxConcurrentCheckpoints(1);
         checkpointConfig.setExternalizedCheckpointCleanup(
@@ -132,8 +190,7 @@ public class NetTrafficSentinel {
             checkpointConfig.setCheckpointStorage(checkpointDir);
             LOG.info("Checkpoint storage: {}", checkpointDir);
         } else {
-            LOG.warn("checkpoint.storage.path is empty. Flink will use its configured/default checkpoint storage. "
-                    + "For production YARN, configure an HDFS checkpoint path.");
+            LOG.warn("checkpoint.storage.path is empty. Configure an HDFS path for production YARN recovery.");
         }
     }
 
@@ -142,15 +199,42 @@ public class NetTrafficSentinel {
         if (windowMinutes <= 0 || 60 % windowMinutes != 0) {
             throw new IllegalArgumentException("window.size.minutes must be a positive divisor of 60");
         }
-        if (config.getInt("source.parallelism", 1) != 1) {
-            throw new IllegalArgumentException("This version requires source.parallelism=1");
+        if (config.getLong("kafka.input.max.out.of.orderness.minutes", 360L) < 0L) {
+            throw new IllegalArgumentException("kafka.input.max.out.of.orderness.minutes must be >= 0");
         }
+        if (config.getLong("kafka.input.watermark.idle.timeout.minutes", 2L) < 0L) {
+            throw new IllegalArgumentException("kafka.input.watermark.idle.timeout.minutes must be >= 0");
+        }
+        if (config.getInt("kafka.input.source.parallelism", 0) < 0) {
+            throw new IllegalArgumentException("kafka.input.source.parallelism must be 0(auto) or positive");
+        }
+        if (config.get("kafka.input.topic", "METRIC-ENDPOINT").trim().isEmpty()) {
+            throw new IllegalArgumentException("kafka.input.topic must not be blank");
+        }
+        if (config.get("kafka.input.group.id", "").trim().isEmpty()) {
+            throw new IllegalArgumentException("kafka.input.group.id must not be blank");
+        }
+
+        String startMode = config.get("kafka.input.start.mode", "latest").toLowerCase(Locale.ROOT);
+        if (!"earliest".equals(startMode)
+                && !"latest".equals(startMode)
+                && !"committed".equals(startMode)
+                && !"timestamp".equals(startMode)) {
+            throw new IllegalArgumentException(
+                    "kafka.input.start.mode must be earliest, latest, committed or timestamp");
+        }
+        if ("timestamp".equals(startMode)) {
+            String text = config.get("kafka.input.start.timestamp", "").trim();
+            if (text.isEmpty()) {
+                throw new IllegalArgumentException("kafka.input.start.timestamp is required for timestamp mode");
+            }
+            ZoneId zone = ZoneId.of(config.get("business.timezone", "Asia/Shanghai"));
+            TimeUtils.parse(text, zone);
+        }
+
         String deviceId = config.get("alert.device.id");
         if (!deviceId.matches("\\d{6}")) {
             throw new IllegalArgumentException("alert.device.id must be exactly 6 digits");
-        }
-        if (config.get("doris.password").startsWith("CHANGE_ME_")) {
-            throw new IllegalArgumentException("Use an external application.properties with the Doris password");
         }
         if (!config.getBoolean("rule.large.enabled", true)
                 && !config.getBoolean("rule.offhours.enabled", true)) {
@@ -193,14 +277,11 @@ public class NetTrafficSentinel {
         if (alpha <= 0d || alpha > 1d) {
             throw new IllegalArgumentException("history.pair.ema.alpha must be in (0,1]");
         }
-        if (config.getInt("source.doris.stable.delay.minutes", 60) < 0) {
-            throw new IllegalArgumentException("source.doris.stable.delay.minutes must be >= 0");
-        }
-        String startMode = config.get("source.start.mode", "latest_data");
-        if (!"latest_data".equalsIgnoreCase(startMode)
-                && !"latest_closed".equalsIgnoreCase(startMode)
-                && !"fixed".equalsIgnoreCase(startMode)) {
-            throw new IllegalArgumentException("source.start.mode must be latest_data or fixed");
+
+        // This is a brand-new Kafka topology; deliberately reject any attempt to restore the old Doris state UID.
+        if (config.getBoolean("migration.restore.old.doris.state", false)) {
+            throw new IllegalArgumentException(
+                    "Old Doris source state migration is intentionally unsupported; start this Kafka job with fresh state");
         }
     }
 }

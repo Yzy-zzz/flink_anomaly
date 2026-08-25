@@ -18,14 +18,11 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 【导读：一个 5 分钟窗口的“总分析器”】
+ * One complete business-time window analyzer.
  *
- * DorisPollingAlertSource 每开始处理一个新窗口，就 new 一个本类。
- * add() 负责逐行累计；finish() 负责在窗口全部读完后统一做最终判定。
- * 这样可以保证“算法读取历史”和“历史真正更新”是两个阶段，避免当前窗口边读边污染基线。
- *
- * In-memory analyzer for one five-minute Doris query.
- * Long-lived history is read-only while the query runs; a bounded update plan is returned at finish().
+ * <p>The Kafka version can have several windows open at the same time while waiting for delayed
+ * records.  Snapshot/restore support therefore stores only this window's bounded accumulators and
+ * cached context thresholds, never the whole long-lived history store.</p>
  */
 public final class FiveMinuteWindowAnalyzer implements Serializable {
     private static final long serialVersionUID = 1L;
@@ -44,11 +41,18 @@ public final class FiveMinuteWindowAnalyzer implements Serializable {
     private final OffHoursAccumulator offHoursAccumulator;
     private final LargeTrafficDetector largeDetector;
     private final OffHoursDetector offHoursDetector;
-    private final Map<String, ContextStats> contextStatsCache = new HashMap<>();
+    private final Map<String, ContextStats> contextStatsCache;
     private long rowCount;
     private long offHoursRowCount;
 
     public FiveMinuteWindowAnalyzer(AppConfig config, HistoricalBaselineStore historyStore, WindowRange window) {
+        this(config, historyStore, window, null);
+    }
+
+    public FiveMinuteWindowAnalyzer(AppConfig config,
+                                    HistoricalBaselineStore historyStore,
+                                    WindowRange window,
+                                    Snapshot restored) {
         this.largeEnabled = config.getBoolean("rule.large.enabled", true);
         this.offHoursEnabled = config.getBoolean("rule.offhours.enabled", true);
         this.weekdayStartHour = config.getInt("rule.offhours.weekday.start.hour", 20);
@@ -60,9 +64,11 @@ public final class FiveMinuteWindowAnalyzer implements Serializable {
         this.historyStore = historyStore;
 
         if (largeEnabled) {
-            this.largeAccumulator = new LargeTrafficAccumulator(
-                    config.getDouble("rule.large.tdigest.compression", 200d),
-                    config.getInt("rule.large.candidate.capacity", 20000));
+            this.largeAccumulator = restored != null && restored.largeAccumulator != null
+                    ? restored.largeAccumulator
+                    : new LargeTrafficAccumulator(
+                            config.getDouble("rule.large.tdigest.compression", 200d),
+                            config.getInt("rule.large.candidate.capacity", 20000));
             this.largeDetector = new LargeTrafficDetector(config);
         } else {
             this.largeAccumulator = null;
@@ -70,21 +76,26 @@ public final class FiveMinuteWindowAnalyzer implements Serializable {
         }
 
         if (offHoursEnabled) {
-            this.offHoursAccumulator = new OffHoursAccumulator(
-                    config.getInt("rule.offhours.sketch.capacity", 2048));
+            this.offHoursAccumulator = restored != null && restored.offHoursAccumulator != null
+                    ? restored.offHoursAccumulator
+                    : new OffHoursAccumulator(config.getInt("rule.offhours.sketch.capacity", 2048));
             this.offHoursDetector = new OffHoursDetector(config);
         } else {
             this.offHoursAccumulator = null;
             this.offHoursDetector = null;
         }
+
+        this.contextStatsCache = restored != null && restored.contextStatsCache != null
+                ? new HashMap<>(restored.contextStatsCache)
+                : new HashMap<String, ContextStats>();
+        this.rowCount = restored == null ? 0L : restored.rowCount;
+        this.offHoursRowCount = restored == null ? 0L : restored.offHoursRowCount;
     }
 
-    /** 每来一条 Doris 指标记录就调用一次；这里只做累计，不输出最终告警。 */
+    /** Add one normalized metric record to this business-time window. */
     public void add(MetricRecord record, LocalDateTime collectLocalTime) {
         rowCount++;
         if (largeEnabled) {
-            // type=2 的 Context = 协议 + 工作日/周末 + 时间槽。
-            // 注意：Context 不包含 srcIp/dstIp，因此同一 Context 下很多不同 IP 对共享一个分布基线。
             String contextKey = ContextKey.of(record.getProtocol(), collectLocalTime, contextSlotMinutes);
             ContextStats stats = contextStatsCache.get(contextKey);
             if (stats == null) {
@@ -99,18 +110,17 @@ public final class FiveMinuteWindowAnalyzer implements Serializable {
         }
     }
 
-    /**
-     * 窗口读取完毕后统一收尾：
-     * 1) type=2 做最终阈值判断并生成 Pair 学习样本；
-     * 2) 生成 Context 历史更新；
-     * 3) type=3 输出非工作时间 Top-N；
-     * 4) 返回给 Source，等 Source 在 checkpointLock 内一次性 apply。
-     */
+    /** Finish this complete window and produce alerts plus one atomic history-update plan. */
     public WindowAnalysisResult finish() {
         List<AlertRecord> alerts = new ArrayList<>();
         HistoricalBaselineStore.WindowUpdate historyUpdate = new HistoricalBaselineStore.WindowUpdate();
 
         if (largeEnabled) {
+            // Delayed Kafka windows may have been opened hours earlier. Refresh the read-only
+            // historical context view now so final detection uses all earlier windows that have
+            // since been finalized in event-time order.
+            largeAccumulator.refreshHistoricalStats(
+                    historyStore, currentDate, bytesQuantile, pktsQuantile);
             LargeTrafficDetector.DetectionResult largeResult = largeDetector.detect(largeAccumulator, historyStore);
             alerts.addAll(largeResult.getAlerts());
             for (HistoricalBaselineStore.PairSample pairSample : largeResult.getPairSamples()) {
@@ -126,7 +136,41 @@ public final class FiveMinuteWindowAnalyzer implements Serializable {
         return new WindowAnalysisResult(alerts, historyUpdate);
     }
 
+    /** Compact checkpoint image for one still-open Kafka event-time window. */
+    public Snapshot snapshot() {
+        return new Snapshot(
+                largeAccumulator,
+                offHoursAccumulator,
+                new HashMap<>(contextStatsCache),
+                rowCount,
+                offHoursRowCount);
+    }
+
     public long getRowCount() { return rowCount; }
     public long getOffHoursRowCount() { return offHoursRowCount; }
     public int getLargeContextCount() { return largeAccumulator == null ? 0 : largeAccumulator.getContextCount(); }
+
+    public static final class Snapshot implements Serializable {
+        private static final long serialVersionUID = 1L;
+        public LargeTrafficAccumulator largeAccumulator;
+        public OffHoursAccumulator offHoursAccumulator;
+        public Map<String, ContextStats> contextStatsCache;
+        public long rowCount;
+        public long offHoursRowCount;
+
+        public Snapshot() {
+        }
+
+        public Snapshot(LargeTrafficAccumulator largeAccumulator,
+                        OffHoursAccumulator offHoursAccumulator,
+                        Map<String, ContextStats> contextStatsCache,
+                        long rowCount,
+                        long offHoursRowCount) {
+            this.largeAccumulator = largeAccumulator;
+            this.offHoursAccumulator = offHoursAccumulator;
+            this.contextStatsCache = contextStatsCache;
+            this.rowCount = rowCount;
+            this.offHoursRowCount = offHoursRowCount;
+        }
+    }
 }

@@ -30,8 +30,8 @@ public final class KafkaSinkFactory {
 
     public static KafkaSink<String> create(AppConfig config) {
         String bootstrapServers = config.get("kafka.bootstrap.servers", "localhost:9092");
-        String topic = config.get("kafka.topic", "anomaly_alert");
-        String delivery = config.get("kafka.delivery.guarantee", "at_least_once");
+        String topic = config.get("kafka.output.topic", config.get("kafka.topic", "anomaly_alert"));
+        String delivery = config.get("kafka.output.delivery.guarantee", config.get("kafka.delivery.guarantee", "at_least_once"));
 
         Properties producerProperties = buildProducerProperties(config);
 
@@ -60,7 +60,7 @@ public final class KafkaSinkFactory {
 
         if ("exactly_once".equalsIgnoreCase(delivery)) {
             builder.setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
-                    .setTransactionalIdPrefix(config.get("kafka.transactional.id.prefix", "anomaly-alert-"));
+                    .setTransactionalIdPrefix(config.get("kafka.output.transactional.id.prefix", config.get("kafka.transactional.id.prefix", "anomaly-alert-")));
         } else if ("at_least_once".equalsIgnoreCase(delivery)) {
             builder.setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE);
         } else {
@@ -90,7 +90,7 @@ public final class KafkaSinkFactory {
         Properties properties = buildSecurityProperties(config);
         properties.put(
                 ProducerConfig.CLIENT_ID_CONFIG,
-                config.get("kafka.client.id", "net-traffic-sentinel-alert"));
+                config.get("kafka.output.client.id", config.get("kafka.client.id", "net-traffic-sentinel-alert")));
 
         if (config.getBoolean("kafka.monitor.delivery.log.enabled", true)) {
             properties.put(

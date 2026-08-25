@@ -78,6 +78,19 @@ public final class LargeTrafficAccumulator implements Serializable {
     }
 
     /**
+     * Refresh detection-time context baselines just before a delayed Kafka window is finalized.
+     * A window can stay open for hours, so baselines captured when its first record arrived may be
+     * older than baselines available when event-time finally closes the window.
+     */
+    public void refreshHistoricalStats(HistoricalBaselineStore historyStore, LocalDate currentDate,
+                                       double bytesQuantile, double pktsQuantile) {
+        for (String contextKey : contexts.keySet()) {
+            historicalStats.put(contextKey, historyStore.contextStats(
+                    contextKey, currentDate, bytesQuantile, pktsQuantile));
+        }
+    }
+
+    /**
      * 当历史 Context 还不成熟时，用当前窗口自身的分布临时兜底。
      * 这就是冷启动阶段 baseline 可能来自 CURRENT_CONTEXT_P50 的来源。
      */

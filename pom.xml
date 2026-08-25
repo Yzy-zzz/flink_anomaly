@@ -8,14 +8,13 @@
     <artifactId>NetTrafficSentinel</artifactId>
     <version>1.0-SNAPSHOT</version>
     <name>NetTrafficSentinel</name>
-    <description>Long-running Flink Doris network anomaly detector</description>
+    <description>Long-running Flink Kafka network anomaly detector</description>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.source>8</maven.compiler.source>
         <maven.compiler.target>8</maven.compiler.target>
         <flink.version>1.17.2</flink.version>
-        <mysql.connector.version>8.0.33</mysql.connector.version>
         <tdigest.version>3.3</tdigest.version>
         <jackson.version>2.14.2</jackson.version>
         <junit.version>4.13.2</junit.version>
@@ -36,14 +35,7 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- Long-running Doris polling uses the MySQL-compatible JDBC protocol. -->
-        <dependency>
-            <groupId>com.mysql</groupId>
-            <artifactId>mysql-connector-j</artifactId>
-            <version>${mysql.connector.version}</version>
-        </dependency>
-
-        <!-- Kafka DataStream sink. -->
+        <!-- Kafka DataStream source + sink. -->
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-connector-kafka</artifactId>
@@ -89,6 +81,14 @@
                     <source>${maven.compiler.source}</source>
                     <target>${maven.compiler.target}</target>
                     <encoding>${project.build.sourceEncoding}</encoding>
+                    <!--
+                      Safety for users upgrading by copying files over an old Doris checkout:
+                      the Kafka edition no longer uses this source. Excluding it prevents a stale
+                      DorisPollingAlertSource.java from being compiled into the new job.
+                    -->
+                    <excludes>
+                        <exclude>**/DorisPollingAlertSource.java</exclude>
+                    </excludes>
                 </configuration>
             </plugin>
 

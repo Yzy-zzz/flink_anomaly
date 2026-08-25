@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * 真正的发送失败仍然立即打印 ERROR；第一条 broker ACK 成功时仍打印一次 KAFKA_WRITE_VERIFIED。
  *
  * <p>注意：这里的汇总是 Kafka 传输侧统计。业务 5 分钟检测窗口的异常类型分布，
- * 由 DorisPollingAlertSource 的 ALERT_WINDOW_SUMMARY 输出，两者职责分开。
+ * 由 KafkaWindowAlertProcessFunction 的窗口汇总日志输出，两者职责分开。
  */
 public final class KafkaLoggingProducerInterceptor implements ProducerInterceptor<byte[], byte[]> {
     private static final Logger LOG = LoggerFactory.getLogger(KafkaLoggingProducerInterceptor.class);

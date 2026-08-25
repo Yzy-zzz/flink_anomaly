@@ -1,0 +1,11 @@
+NetTrafficSentinel Kafka input edition
+Revision: kafka-input-v2-overlay-safe
+Date: 2026-08-24
+
+Key fix in this revision:
+- clean Kafka project contains no DorisPollingAlertSource.java
+- WindowRange keeps deprecated toDorisFilter compatibility methods
+- Maven compiler excludes stale DorisPollingAlertSource.java if an old project is accidentally overlaid
+- Java 8 main/test compile-level checks passed
+- offline project logic scenarios: 22/22 passed
+- old-project overlay simulation compile-level checks passed
