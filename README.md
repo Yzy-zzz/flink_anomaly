@@ -1,6 +1,6 @@
 # NetTrafficSentinel（Kafka 输入版）
 
-本工程已将原来的 **Doris JDBC 轮询输入**改为 **Flink KafkaSource 持续消费**。异常算法、5 分钟业务窗口、Context 历史基线、Pair EMA、告警 JSON 和 Kafka 输出保持原有语义。
+本工程已将原来的 **Doris JDBC 轮询输入**改为 **Flink KafkaSource 持续消费**。异常算法、5 分钟业务窗口、Context 历史基线和 Pair EMA 保持原有语义。Kafka 告警输出采用 UTF-8、竖线分隔的 CSV。
 
 默认数据链路：
 
@@ -11,7 +11,7 @@ Kafka METRIC-ENDPOINT
   -> 5 分钟窗口摘要（允许长时间乱序/延迟）
   -> LargeTraffic / OffHours 检测
   -> HistoricalBaselineStore
-  -> AlertRecord -> JSON
+  -> AlertRecord -> CSV（以 | 分隔，仅输出字段值）
   -> Kafka anomaly_alert
 ```
 
@@ -237,6 +237,26 @@ checkpoint.storage.path=hdfs:///flink-checkpoints/net-traffic-sentinel-kafka
 - Flink event-time timers。
 
 因此**本 Kafka 版本自身**发生故障后可以继续从自己的 checkpoint 恢复。
+
+### 6.1 Kafka 告警 CSV 格式
+
+Kafka 消息 value 使用 UTF-8 编码，只输出字段值，不输出表头。固定 12 列，顺序为：
+
+```text
+logId|collectTime|srcIp|dstIp|protocol|packetCount|totalBytes|anomalyType|anomalyDetail|remark1|remark2|vendorCode
+```
+
+`packetCount` 和 `totalBytes` 为当前 5 分钟窗口内同一 `srcIp + dstIp + protocol` 的有界候选累计值，双向包数/字节数分别相加。Type=2 汇总窗口结束时仍保留的大流量候选；Type=3 汇总 Space-Saving 条目被保留期间观察到的记录。候选被淘汰时可能少计，Type=3 的新条目不会继承被淘汰连接的包数或字节数。累计溢出时取 `Long.MAX_VALUE`。
+
+`anomalyDetail` 保留为一个 JSON 对象字段。包含 `|`、双引号或换行的字段按 CSV 规则加双引号，字段内的双引号写成两个双引号。缺失或仅含空白的文本字段输出为空串，保留分隔符和列位置。消费端应使用分隔符为 `|`、引号为 `"` 的 CSV 解析器，然后解析 `anomalyDetail` JSON。
+
+示例（Type=3）：
+
+```text
+2026082412345600000000000000000002|2026-08-24 03:15:00|10.0.0.1|10.0.0.2|TCP|12450|15728640|3|"{""topRank"":1,""TopN"":100,""conns"":5000}"|||V001
+```
+
+启用 `alert.output.log.enabled` 时，本地告警日志继续使用 JSON，并包含新增的 `packetCount`、`totalBytes` 字段。
 
 ## 7. 主要配置
 

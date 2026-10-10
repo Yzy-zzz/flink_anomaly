@@ -21,7 +21,7 @@ public class OffHoursAccumulator implements Serializable {
 
     public void add(MetricRecord record) {
         sketch.update(ConnectionKey.encode(record.getSrcIp(), record.getDstIp(), record.getProtocol()),
-                record.getConnCount(), record.getCollectTime());
+                record.getConnCount(), record.getCollectTime(), record.totalPkts(), record.totalBytes());
     }
 
     public void mergeFrom(OffHoursAccumulator other) {

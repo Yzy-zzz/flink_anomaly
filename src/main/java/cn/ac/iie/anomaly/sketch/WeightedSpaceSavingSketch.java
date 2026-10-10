@@ -29,20 +29,33 @@ public class WeightedSpaceSavingSketch implements Serializable {
     }
 
     public void update(String key, long weight, String collectTime) {
-        if (key == null || weight <= 0) {
+        if (weight <= 0L) {
+            return;
+        }
+        update(key, weight, collectTime, 0L, 0L);
+    }
+
+    /** Packet/byte totals count observed rows for the retained key, without inherited estimates. */
+    public void update(String key, long weight, String collectTime, long packetCount, long totalBytes) {
+        if (key == null || weight < 0) {
             return;
         }
         Integer index = indexByKey.get(key);
         if (index != null) {
             Entry entry = heap.get(index);
             entry.estimate = saturatingAdd(entry.estimate, weight);
+            entry.packetCount = saturatingAdd(entry.packetCount, packetCount);
+            entry.totalBytes = saturatingAdd(entry.totalBytes, totalBytes);
             entry.collectTime = laterCollectTime(entry.collectTime, collectTime);
             siftDown(index);
             return;
         }
+        if (weight == 0L) {
+            return;
+        }
 
         if (heap.size() < capacity) {
-            Entry entry = new Entry(key, weight, 0L, collectTime);
+            Entry entry = new Entry(key, weight, 0L, collectTime, packetCount, totalBytes);
             heap.add(entry);
             int newIndex = heap.size() - 1;
             indexByKey.put(key, newIndex);
@@ -57,6 +70,9 @@ public class WeightedSpaceSavingSketch implements Serializable {
         min.error = oldMin;
         min.estimate = saturatingAdd(oldMin, weight);
         min.collectTime = collectTime;
+        // The evicted key's packet/byte counters belong to another connection.
+        min.packetCount = packetCount;
+        min.totalBytes = totalBytes;
         indexByKey.put(key, 0);
         siftDown(0);
     }
@@ -83,7 +99,7 @@ public class WeightedSpaceSavingSketch implements Serializable {
 
     public void mergeFrom(WeightedSpaceSavingSketch other) {
         for (Entry entry : other.entries()) {
-            update(entry.key, entry.estimate, entry.collectTime);
+            update(entry.key, entry.estimate, entry.collectTime, entry.packetCount, entry.totalBytes);
         }
     }
 
@@ -158,16 +174,20 @@ public class WeightedSpaceSavingSketch implements Serializable {
         private long estimate;
         private long error;
         private String collectTime;
+        private long packetCount;
+        private long totalBytes;
 
-        Entry(String key, long estimate, long error, String collectTime) {
+        Entry(String key, long estimate, long error, String collectTime, long packetCount, long totalBytes) {
             this.key = key;
             this.estimate = estimate;
             this.error = error;
             this.collectTime = collectTime;
+            this.packetCount = packetCount;
+            this.totalBytes = totalBytes;
         }
 
         Entry copy() {
-            return new Entry(key, estimate, error, collectTime);
+            return new Entry(key, estimate, error, collectTime, packetCount, totalBytes);
         }
 
         public String getKey() { return key; }
@@ -175,5 +195,7 @@ public class WeightedSpaceSavingSketch implements Serializable {
         public long getError() { return error; }
         public long getLowerBound() { return Math.max(0L, estimate - error); }
         public String getCollectTime() { return collectTime; }
+        public long getPacketCount() { return packetCount; }
+        public long getTotalBytes() { return totalBytes; }
     }
 }

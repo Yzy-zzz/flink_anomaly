@@ -53,7 +53,7 @@ NetTrafficSentinel 就是网络世界的"智能保安"，7×24 小时自动监�
 ```
 输入：Kafka Topic "METRIC-ENDPOINT"（网络流量指标数据，JSON 格式）
   ↓ 经过实时分析处理
-输出：Kafka Topic "anomaly_alert"（异常告警，JSON 格式）
+输出：Kafka Topic "anomaly_alert"（异常告警，UTF-8、竖线分隔的 CSV 格式）
 ```
 
 ---
@@ -140,7 +140,8 @@ NetTrafficSentinel/
 │   │   │       │
 │   │   │       ├── sink/            # 输出相关
 │   │   │       │   ├── KafkaSinkFactory.java          # 创建 Kafka 生产者
-│   │   │       │   ├── AlertJsonMapper.java           # 告警对象转 JSON
+│   │   │       │   ├── AlertCsvMapper.java            # Kafka 告警对象转 CSV
+│   │   │       │   ├── AlertJsonMapper.java           # 本地告警对象转 JSON
 │   │   │       │   └── LocalLogSink.java              # 本地日志输出（测试用）
 │   │   │       │
 │   │   │       └── util/            # 工具类
@@ -272,11 +273,11 @@ t-digest 是一种**近似分位数计算**的数据结构。想象你有 100 �
                             │ AlertRecord 对象
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Step 6: AlertJsonMapper + KafkaSinkFactory                     │
-│  - AlertRecord → JSON 字符串                                    │
+│  Step 6: AlertCsvMapper + KafkaSinkFactory                      │
+│  - AlertRecord → 竖线分隔的 CSV 字符串                            │
 │  - 发送到 Kafka Topic: anomaly_alert                             │
 └───────────────────────────┬─────────────────────────────────────┘
-                            │ JSON 字符串
+                            │ CSV 字符串
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  下游系统消费告警（如 SIEM、告警平台、可视化大屏等）                 │
@@ -702,7 +703,17 @@ history.emaBytes = history.emaBytes * (1 - 0.10) + currentBytes * 0.10;
 
 #### AlertRecord 结构
 
-**Type=2（大流量）告警 JSON：**
+Kafka 输出由 `AlertCsvMapper` 固定为下面 12 列，只输出字段值，不输出表头，编码为 UTF-8：
+
+```text
+logId|collectTime|srcIp|dstIp|protocol|packetCount|totalBytes|anomalyType|anomalyDetail|remark1|remark2|vendorCode
+```
+
+`packetCount`、`totalBytes` 为同一连接在 5 分钟窗口内的有界候选累计值，分别合计双向包数和字节数。Type=2 只汇总仍保留的候选，Type=3 只累计该条目被保留期间观察到的记录；淘汰可能造成少计。`anomalyDetail` 保留为一列 JSON，字段中的双引号按 CSV 规则加倍，包含分隔符、双引号或换行的字段整体用双引号包裹。可选字段缺失时保留空列。完整 CSV 示例见 README 的 6.1 节。
+
+以下 JSON 展示告警对象结构；启用本地告警日志时仍输出这种 JSON 格式。
+
+**Type=2（大流量）告警对象 / 本地日志 JSON：**
 ```json
 {
   "logId": "2026082412345600000000000000000001",
@@ -710,6 +721,8 @@ history.emaBytes = history.emaBytes * (1 - 0.10) + currentBytes * 0.10;
   "srcIp": "1.224.99.3",
   "dstIp": "183.93.235.217",
   "protocol": "UNKNOWN",
+  "packetCount": 1000,
+  "totalBytes": 5242880,
   "anomalyType": 2,
   "anomalyDetail": {
     "current_bytes": 5242880,
@@ -727,7 +740,7 @@ history.emaBytes = history.emaBytes * (1 - 0.10) + currentBytes * 0.10;
 }
 ```
 
-**Type=3（非工作时间）告警 JSON：**
+**Type=3（非工作时间）告警对象 / 本地日志 JSON：**
 ```json
 {
   "logId": "2026082412345600000000000000000002",
@@ -735,6 +748,8 @@ history.emaBytes = history.emaBytes * (1 - 0.10) + currentBytes * 0.10;
   "srcIp": "10.0.0.1",
   "dstIp": "10.0.0.2",
   "protocol": "TCP",
+  "packetCount": 12450,
+  "totalBytes": 15728640,
   "anomalyType": 3,
   "anomalyDetail": {
     "topRank": 1,

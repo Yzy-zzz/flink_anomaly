@@ -8,6 +8,10 @@ import cn.ac.iie.anomaly.config.WindowRange;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,7 +24,7 @@ public class FiveMinuteWindowAnalyzerTest {
     private static final DateTimeFormatter F = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     @Test
-    public void offHoursProducesConfiguredTopN() throws Exception {
+    public void offHoursProducesConfiguredTopNWithTrafficAfterRestore() throws Exception {
         Path file = Files.createTempFile("net-traffic-sentinel-analyzer-", ".properties");
         String props =
                 "rule.large.enabled=false\n" +
@@ -46,11 +50,27 @@ public class FiveMinuteWindowAnalyzerTest {
                         text, time.atZone(zone).toInstant().toEpochMilli(),
                         "10.0.0." + (i % 3), "10.0.1.1", "TCP",
                         i + 1, 1, 1, 10, 10), time);
+                if (i == 4) {
+                    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                    try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+                        out.writeObject(analyzer.snapshot());
+                    }
+                    try (ObjectInputStream in = new ObjectInputStream(
+                            new ByteArrayInputStream(bytes.toByteArray()))) {
+                        analyzer = new FiveMinuteWindowAnalyzer(config, new HistoricalBaselineStore(config),
+                                window, (FiveMinuteWindowAnalyzer.Snapshot) in.readObject());
+                    }
+                }
             }
             List<AlertRecord> alerts = analyzer.finish().getAlerts();
             Assert.assertEquals(2, alerts.size());
             Assert.assertEquals(3, alerts.get(0).getAnomalyType());
             Assert.assertEquals(3, alerts.get(1).getAnomalyType());
+            Assert.assertEquals("10.0.0.0", alerts.get(0).getSrcIp());
+            Assert.assertEquals(8L, alerts.get(0).getPacketCount());
+            Assert.assertEquals(80L, alerts.get(0).getTotalBytes());
+            Assert.assertEquals(6L, alerts.get(1).getPacketCount());
+            Assert.assertEquals(60L, alerts.get(1).getTotalBytes());
         } finally {
             Files.deleteIfExists(file);
         }

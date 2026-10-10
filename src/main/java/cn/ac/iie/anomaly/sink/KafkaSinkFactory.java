@@ -10,6 +10,7 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Properties;
 
 /**
@@ -55,7 +56,7 @@ public final class KafkaSinkFactory {
                 .setKafkaProducerConfig(producerProperties)
                 .setRecordSerializer(KafkaRecordSerializationSchema.builder()
                         .setTopic(topic)
-                        .setValueSerializationSchema(new SimpleStringSchema())
+                        .setValueSerializationSchema(new SimpleStringSchema(StandardCharsets.UTF_8))
                         .build());
 
         if ("exactly_once".equalsIgnoreCase(delivery)) {

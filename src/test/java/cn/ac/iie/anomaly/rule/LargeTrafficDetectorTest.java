@@ -45,6 +45,8 @@ public class LargeTrafficDetectorTest {
             Assert.assertEquals(1, result.getAlerts().size());
             AlertRecord alert = result.getAlerts().get(0);
             Assert.assertEquals(2, alert.getAnomalyType());
+            Assert.assertEquals(50L, alert.getPacketCount());
+            Assert.assertEquals(5000L, alert.getTotalBytes());
 
             Map<String, Object> detail = alert.getAnomalyDetail();
             Assert.assertEquals("type=2 detail should stay compact", 8, detail.size());
@@ -157,6 +159,29 @@ public class LargeTrafficDetectorTest {
             Assert.assertEquals("mature anomaly must not increment pair sample count", 3L, after.getSampleCount());
             Assert.assertEquals(100d, after.getEmaBytes(), 0.001d);
             Assert.assertEquals(1d, after.getEmaPkts(), 0.001d);
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    public void type2TotalsIncludeOnlyRetainedCandidatesOfTheAlertedPair() throws Exception {
+        Path file = tempConfig(true);
+        try {
+            AppConfig config = AppConfig.load(new String[]{"--config", file.toString()});
+            HistoricalBaselineStore store = new HistoricalBaselineStore(config);
+            LocalDateTime time = LocalDateTime.of(2026, 8, 17, 0, 1);
+            String contextKey = seedHistoricalContext(store, time);
+            ContextStats history = store.contextStats(contextKey, time.toLocalDate(), 0.999d, 0.999d);
+            LargeTrafficAccumulator acc = new LargeTrafficAccumulator(100d, 2);
+            acc.add(metric(time, "10.0.0.1", "10.0.0.2", 100L, 1L), contextKey, history);
+            acc.add(metric(time.plusMinutes(1), "10.0.0.1", "10.0.0.2", 200L, 2L), contextKey, history);
+            acc.add(metric(time.plusMinutes(2), "10.0.0.1", "10.0.0.2", 5000L, 50L), contextKey, history);
+            AlertRecord alert = new LargeTrafficDetector(config).detect(acc, store).getAlerts().get(0);
+            Assert.assertEquals(2, acc.candidateSnapshot().size());
+            Assert.assertEquals(52L, alert.getPacketCount());
+            Assert.assertEquals(5200L, alert.getTotalBytes());
+            Assert.assertEquals(5000L, ((Number) alert.getAnomalyDetail().get("current_bytes")).longValue());
         } finally {
             Files.deleteIfExists(file);
         }

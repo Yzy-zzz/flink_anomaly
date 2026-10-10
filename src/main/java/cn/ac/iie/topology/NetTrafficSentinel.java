@@ -4,6 +4,7 @@ import cn.ac.iie.anomaly.config.AppConfig;
 import cn.ac.iie.anomaly.config.WindowRange;
 import cn.ac.iie.anomaly.model.AlertRecord;
 import cn.ac.iie.anomaly.model.MetricRecord;
+import cn.ac.iie.anomaly.sink.AlertCsvMapper;
 import cn.ac.iie.anomaly.sink.AlertJsonMapper;
 import cn.ac.iie.anomaly.sink.KafkaConnectivityProbe;
 import cn.ac.iie.anomaly.sink.KafkaSinkFactory;
@@ -38,7 +39,7 @@ import java.util.Locale;
  *
  * Pipeline:
  * Kafka(METRIC-ENDPOINT JSON) -> normalize/validate -> collectTime event-time + watermark
- * -> ordered 5-minute anomaly analyzer -> JSON -> log/Kafka(anomaly_alert).
+ * -> ordered 5-minute anomaly analyzer -> JSON local log / CSV Kafka(anomaly_alert).
  */
 public class NetTrafficSentinel {
     private static final Logger LOG = LoggerFactory.getLogger(NetTrafficSentinel.class);
@@ -124,19 +125,23 @@ public class NetTrafficSentinel {
                 .uid("five-minute-kafka-anomaly-analyzer-v1")
                 .setParallelism(1);
 
-        SingleOutputStreamOperator<String> jsonAlerts = alerts
-                .map(new AlertJsonMapper())
-                .name("alert-to-json")
-                .uid("alert-to-json-v3")
-                .setParallelism(1);
-
         boolean logEnabled = config.getBoolean("alert.output.log.enabled", false);
         boolean kafkaEnabled = config.getBoolean("alert.output.kafka.enabled", true);
         if (logEnabled) {
+            SingleOutputStreamOperator<String> jsonAlerts = alerts
+                    .map(new AlertJsonMapper())
+                    .name("alert-to-json")
+                    .uid("alert-to-json-v3")
+                    .setParallelism(1);
             jsonAlerts.addSink(new LocalLogSink()).name("alert-local-log").uid("alert-local-log-v3");
         }
         if (kafkaEnabled) {
-            SingleOutputStreamOperator<String> kafkaAlerts = jsonAlerts
+            SingleOutputStreamOperator<String> csvAlerts = alerts
+                    .map(new AlertCsvMapper())
+                    .name("alert-to-csv")
+                    .uid("alert-to-csv-v1")
+                    .setParallelism(1);
+            SingleOutputStreamOperator<String> kafkaAlerts = csvAlerts
                     .map(new KafkaConnectivityProbe(config))
                     .name("kafka-output-connectivity-probe")
                     .uid("kafka-output-connectivity-probe-v2");
@@ -145,7 +150,11 @@ public class NetTrafficSentinel {
                     .uid("alert-kafka-v3");
         }
         if (!logEnabled && !kafkaEnabled) {
-            jsonAlerts.addSink(new NoOpStringSink()).name("alert-noop").uid("alert-noop-v3");
+            alerts.map(new AlertCsvMapper())
+                    .name("alert-to-csv")
+                    .uid("alert-to-csv-v1")
+                    .setParallelism(1)
+                    .addSink(new NoOpStringSink()).name("alert-noop").uid("alert-noop-v3");
         }
 
         env.execute(config.get("job.name", "NET-TRAFFIC-ANOMALY"));

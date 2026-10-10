@@ -139,8 +139,18 @@ public final class LargeTrafficDetector implements Serializable {
             }
         }
 
+        // Sum only retained candidates for each alerted pair, preserving bounded window memory.
+        for (LargeTrafficAccumulator.Candidate candidate : candidates) {
+            MetricRecord record = candidate.getRecord();
+            AlertWithBytes value = bestAlertByPair.get(record.pairKey());
+            if (value != null) {
+                value.packetCount = saturatingAdd(value.packetCount, record.totalPkts());
+                value.totalBytes = saturatingAdd(value.totalBytes, record.totalBytes());
+            }
+        }
         List<AlertRecord> alerts = new ArrayList<>(bestAlertByPair.size());
         for (AlertWithBytes value : bestAlertByPair.values()) {
+            value.alert.assignTrafficTotals(value.packetCount, value.totalBytes);
             alerts.add(value.alert);
         }
 
@@ -210,6 +220,10 @@ public final class LargeTrafficDetector implements Serializable {
         return value >= Long.MAX_VALUE ? Long.MAX_VALUE : Math.round(value);
     }
 
+    private static long saturatingAdd(long a, long b) {
+        return b > 0L && a > Long.MAX_VALUE - b ? Long.MAX_VALUE : a + b;
+    }
+
     private static final class BootstrapLearningCap {
         private final long bytes;
         private final long pkts;
@@ -223,6 +237,8 @@ public final class LargeTrafficDetector implements Serializable {
     private static final class AlertWithBytes {
         private final AlertRecord alert;
         private final long currentBytes;
+        private long packetCount;
+        private long totalBytes;
         private AlertWithBytes(AlertRecord alert, long currentBytes) {
             this.alert = alert;
             this.currentBytes = currentBytes;

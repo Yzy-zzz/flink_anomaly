@@ -5,7 +5,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * 最终告警对象。Jackson 会通过 getter 把它序列化成 JSON。
+ * 最终告警对象。输出 Mapper 按固定字段顺序序列化。
  * anomalyDetail 使用 LinkedHashMap，是为了让日志字段顺序稳定、便于人工阅读。
  */
 public class AlertRecord implements Serializable {
@@ -16,6 +16,8 @@ public class AlertRecord implements Serializable {
     private String srcIp;
     private String dstIp;
     private String protocol;
+    private long packetCount;
+    private long totalBytes;
     private int anomalyType;
     private Map<String, Object> anomalyDetail = new LinkedHashMap<>();
     private String remark1;
@@ -36,6 +38,7 @@ public class AlertRecord implements Serializable {
                                            MetricRecord metric, LargeTrafficEvidence evidence) {
         AlertRecord alert = base(vendorCode, remark1, remark2, metric.getCollectTime(),
                 metric.getSrcIp(), metric.getDstIp(), metric.getProtocol(), 2);
+        alert.assignTrafficTotals(metric.totalPkts(), metric.totalBytes());
         alert.anomalyDetail.put("current_bytes", metric.totalBytes());
         alert.anomalyDetail.put("current_pkts", metric.totalPkts());
         alert.anomalyDetail.put("baseline_bytes", evidence.baselineBytes);
@@ -88,11 +91,21 @@ public class AlertRecord implements Serializable {
         this.logId = logId;
     }
 
+    public void assignTrafficTotals(long packetCount, long totalBytes) {
+        if (packetCount < 0L || totalBytes < 0L) {
+            throw new IllegalArgumentException("traffic totals must not be negative");
+        }
+        this.packetCount = packetCount;
+        this.totalBytes = totalBytes;
+    }
+
     public String getLogId() { return logId; }
     public String getCollectTime() { return collectTime; }
     public String getSrcIp() { return srcIp; }
     public String getDstIp() { return dstIp; }
     public String getProtocol() { return protocol; }
+    public long getPacketCount() { return packetCount; }
+    public long getTotalBytes() { return totalBytes; }
     public int getAnomalyType() { return anomalyType; }
     public Map<String, Object> getAnomalyDetail() { return anomalyDetail; }
     public String getRemark1() { return remark1; }

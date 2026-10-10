@@ -37,10 +37,12 @@ public final class OffHoursDetector implements Serializable {
         int rank = 1;
         for (WeightedSpaceSavingSketch.Entry entry : top) {
             ConnectionKey.Parts parts = ConnectionKey.decode(entry.getKey());
-            alerts.add(AlertRecord.offHours(
+            AlertRecord alert = AlertRecord.offHours(
                     vendorCode, remark1, remark2,
                     entry.getCollectTime(), parts.srcIp, parts.dstIp, parts.protocol,
-                    rank, topN, entry.getEstimate()));
+                    rank, topN, entry.getEstimate());
+            alert.assignTrafficTotals(entry.getPacketCount(), entry.getTotalBytes());
+            alerts.add(alert);
             rank++;
         }
         return alerts;
